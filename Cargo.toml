@@ -1,0 +1,15 @@
+[package]
+name = "tc-value"
+version = "0.14.0"
+edition = "2021"
+
+[dependencies]
+async-trait = "0.1"
+destream = "0.8"
+hr-id = "0.6"
+number-general = { version = "0.12", default-features = false, features = ["stream"] }
+pathlink = "0.3"
+
+[dev-dependencies]
+destream_json = { version = "0.13", default-features = false }
+futures = "0.3"
