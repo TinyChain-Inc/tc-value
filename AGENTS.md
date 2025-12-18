@@ -11,6 +11,9 @@ other primitives are identified, serialized, and round-tripped through the IR.
 - Extend `ValueType` in lockstep with `Value`; every variant needs a stable path
   rooted at `/state/scalar/value/...`. Never bypass the URI builder or embed
   literal strings—use the helpers in `class.rs`.
+- Match paths via `PathLabel` slices instead of ad-hoc string comparisons. Add
+  new labels/segments beside the types they describe and reuse `path_matches`
+  helpers so every caller enforces TinyChain `Id` validation consistently.
 - Reuse shared primitives (`Number` from `number-general`, `TCRef`, common tuple
   types). Do not introduce crate-specific wrapper structs unless they are
   reusable by `tc-state`, `tc-collection`, and adapters.
@@ -38,3 +41,6 @@ other primitives are identified, serialized, and round-tripped through the IR.
   scalar surface changes. `tc-ir`, `tc-state`, and `tc-server` rely on this crate
   staying in lockstep; flag any breaking changes in their respective `AGENTS.md`
   before merging.
+- `destream` is the canonical codec here. Only use `serde` for strictly bounded
+  payloads (e.g., URI query strings) or legacy fixtures, and document those
+  exceptions inline so they can be removed later.

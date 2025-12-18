@@ -1,13 +1,22 @@
 //! Core TinyChain value representations (WIP).
 
+use crate::class::{Class, NativeClass};
 use async_trait::async_trait;
 use destream::{de, en, IntoStream};
 use number_general::Number;
-use pathlink::PathBuf;
-
+use pathlink::{label, path_label, Label, PathBuf, PathLabel, PathSegment};
 pub mod class;
 
-pub use class::ValueType;
+pub use class::{number_type_from_path, number_type_path};
+pub use number_general::NumberType;
+
+const VALUE_PREFIX: PathLabel = path_label(&["state", "scalar", "value"]);
+const SEGMENT_NONE: &str = "none";
+const SEGMENT_NUMBER: &str = "number";
+const SEGMENT_STRING: &str = "string";
+const LABEL_NONE: Label = label(SEGMENT_NONE);
+const LABEL_NUMBER: Label = label(SEGMENT_NUMBER);
+const LABEL_STRING: Label = label(SEGMENT_STRING);
 
 /// High-level TinyChain value enumeration (stub).
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -15,6 +24,7 @@ pub enum Value {
     #[default]
     None,
     Number(Number),
+    String(String),
 }
 
 impl Value {
@@ -22,17 +32,26 @@ impl Value {
         match self {
             Value::None => ValueType::None,
             Value::Number(_) => ValueType::Number,
+            Value::String(_) => ValueType::String,
         }
-    }
-
-    fn map_entry_key(&self) -> PathBuf {
-        self.class().path()
     }
 }
 
 impl From<Number> for Value {
     fn from(n: Number) -> Self {
         Value::Number(n)
+    }
+}
+
+impl From<String> for Value {
+    fn from(value: String) -> Self {
+        Value::String(value)
+    }
+}
+
+impl From<&str> for Value {
+    fn from(value: &str) -> Self {
+        Value::String(value.to_string())
     }
 }
 
@@ -45,6 +64,53 @@ impl From<u64> for Value {
 impl From<()> for Value {
     fn from(_: ()) -> Self {
         Value::None
+    }
+}
+
+/// Value type paths (URI-based type declarations).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ValueType {
+    None,
+    Number,
+    String,
+}
+
+impl ValueType {
+    fn from_suffix(path: &[PathSegment]) -> Option<&PathSegment> {
+        let prefix_len = VALUE_PREFIX.len();
+        if path.len() != prefix_len + 1 {
+            return None;
+        }
+
+        if path[..prefix_len] != VALUE_PREFIX[..] {
+            return None;
+        }
+
+        Some(&path[prefix_len])
+    }
+}
+
+impl Class for ValueType {}
+
+impl NativeClass for ValueType {
+    fn from_path(path: &[PathSegment]) -> Option<Self> {
+        let segment = Self::from_suffix(path)?;
+
+        match segment.as_str() {
+            SEGMENT_NONE => Some(ValueType::None),
+            SEGMENT_NUMBER => Some(ValueType::Number),
+            SEGMENT_STRING => Some(ValueType::String),
+            _ => None,
+        }
+    }
+
+    fn path(&self) -> PathBuf {
+        let prefix = PathBuf::from(VALUE_PREFIX);
+        match self {
+            ValueType::None => prefix.append(LABEL_NONE),
+            ValueType::Number => prefix.append(LABEL_NUMBER),
+            ValueType::String => prefix.append(LABEL_STRING),
+        }
     }
 }
 
@@ -91,10 +157,7 @@ impl de::FromStream for Value {
             }
 
             fn visit_string<E: de::Error>(self, value: String) -> Result<Self::Value, E> {
-                match value.parse::<Number>() {
-                    Ok(number) => Ok(Value::Number(number)),
-                    Err(err) => Err(E::custom(err.to_string())),
-                }
+                Ok(Value::String(value))
             }
 
             async fn visit_map<A: de::MapAccess>(
@@ -124,6 +187,14 @@ impl de::FromStream for Value {
                         let _ = map.next_value::<de::IgnoredAny>(()).await?;
                         Ok(Value::None)
                     }
+                    Some(ValueType::String) => {
+                        let string = map.next_value::<String>(()).await?;
+                        while map.next_key::<de::IgnoredAny>(()).await?.is_some() {
+                            let _ = map.next_value::<de::IgnoredAny>(()).await?;
+                        }
+
+                        Ok(Value::String(string))
+                    }
                     None => Err(de::Error::invalid_value(
                         key,
                         "a known TinyChain value type path",
@@ -150,7 +221,12 @@ impl<'en> en::IntoStream<'en> for Value {
             Value::None => encoder.encode_unit(),
             Value::Number(number) => {
                 let mut map = encoder.encode_map(Some(1))?;
-                map.encode_entry(self.map_entry_key().to_string(), number)?;
+                map.encode_entry(ValueType::Number.path().to_string(), number)?;
+                map.end()
+            }
+            Value::String(string) => {
+                let mut map = encoder.encode_map(Some(1))?;
+                map.encode_entry(ValueType::String.path().to_string(), string)?;
                 map.end()
             }
         }
@@ -182,5 +258,14 @@ mod tests {
         let stream = destream_json::encode(7_u64).expect("encode plain json number");
         let decoded: Value = block_on(destream_json::try_decode((), stream)).expect("decode");
         assert_eq!(decoded, Value::from(7_u64));
+    }
+
+    #[test]
+    fn roundtrip_string_value() {
+        let value = Value::from("hello");
+        let encoded = destream_json::encode(value.clone()).expect("encode string value");
+        let decoded: Value =
+            block_on(destream_json::try_decode((), encoded)).expect("decode string");
+        assert_eq!(decoded, value);
     }
 }
