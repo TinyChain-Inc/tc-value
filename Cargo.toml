@@ -8,7 +8,16 @@ async-trait = "0.1"
 destream = "0.8"
 hr-id = "0.6"
 number-general = { version = "0.12", default-features = false, features = ["stream"] }
-pathlink = "0.3"
+pathlink = { version = "0.3", default-features = false }
+serde = { version = "1", features = ["derive"], optional = true }
+
+[features]
+serialize = [
+    "dep:serde",
+    "pathlink/serialize",
+    "hr-id/serde",
+    "number-general/serde",
+]
 
 [dev-dependencies]
 destream_json = { version = "0.13", default-features = false }

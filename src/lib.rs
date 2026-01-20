@@ -5,6 +5,8 @@ use async_trait::async_trait;
 use destream::{de, en, IntoStream};
 use number_general::Number;
 use pathlink::{label, path_label, Label, PathBuf, PathLabel, PathSegment};
+#[cfg(feature = "serialize")]
+use serde::{Deserialize, Serialize};
 pub mod class;
 
 pub use class::{number_type_from_path, number_type_path};
@@ -19,6 +21,7 @@ const LABEL_NUMBER: Label = label(SEGMENT_NUMBER);
 const LABEL_STRING: Label = label(SEGMENT_STRING);
 
 /// High-level TinyChain value enumeration (stub).
+#[cfg_attr(feature = "serialize", derive(Serialize, Deserialize))]
 #[derive(Clone, Debug, Default, PartialEq)]
 pub enum Value {
     #[default]
@@ -68,6 +71,7 @@ impl From<()> for Value {
 }
 
 /// Value type paths (URI-based type declarations).
+#[cfg_attr(feature = "serialize", derive(Serialize, Deserialize))]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ValueType {
     None,
