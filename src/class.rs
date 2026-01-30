@@ -30,7 +30,7 @@ pub trait NativeClass: Class {
 }
 
 pub fn number_type_from_path(path: &[PathSegment]) -> Option<NumberType> {
-    let prefix_len = NUMBER_PREFIX.len();
+    let prefix_len = NUMBER_PREFIX[..].len();
 
     if path.len() < prefix_len {
         return None;

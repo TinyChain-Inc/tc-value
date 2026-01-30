@@ -1,7 +1,6 @@
 //! Core TinyChain value representations (WIP).
 
 use crate::class::{Class, NativeClass};
-use async_trait::async_trait;
 use destream::{de, en, IntoStream};
 use number_general::Number;
 use pathlink::{label, path_label, Label, PathBuf, PathLabel, PathSegment};
@@ -81,7 +80,7 @@ pub enum ValueType {
 
 impl ValueType {
     fn from_suffix(path: &[PathSegment]) -> Option<&PathSegment> {
-        let prefix_len = VALUE_PREFIX.len();
+        let prefix_len = VALUE_PREFIX[..].len();
         if path.len() != prefix_len + 1 {
             return None;
         }
@@ -118,7 +117,6 @@ impl NativeClass for ValueType {
     }
 }
 
-#[async_trait]
 impl de::FromStream for Value {
     type Context = ();
 
@@ -128,7 +126,6 @@ impl de::FromStream for Value {
     ) -> Result<Self, D::Error> {
         struct ValueVisitor;
 
-        #[async_trait]
         impl de::Visitor for ValueVisitor {
             type Value = Value;
 
