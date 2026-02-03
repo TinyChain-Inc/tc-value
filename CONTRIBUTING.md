@@ -8,15 +8,15 @@ the rest of the TinyChain Open-Source Project.
 
 1. **Represent your work.** By opening a pull request or submitting patches you
    affirm that the contribution is your original work (or that you have the
-   right to contribute it) and that you grant all necessary rights to the
-   TinyChain Open-Source Project.
+   right to contribute it) and that it is unencumbered by third-party
+   intellectual property claims.
 2. **Transfer of rights.** All contributions are made under the repository
-   license (Apache 2.0). By contributing you assign copyright in that work to
-   the TinyChain Open-Source Project so that the community can redistribute and
-   relicense the code as needed.
+   license (Apache 2.0). By contributing you transfer and assign all right,
+   title, and interest in that contribution to The TinyChain Contributors so the
+   community can distribute the code under Apache 2.0.
 3. **Minimal surface area.** Prefer general primitives over bespoke helpers and
    document any deviations from the shared design guidance in
-   [`AGENTS.md`](../AGENTS.md) at the workspace root.
+   [`AGENTS.md`](./AGENTS.md).
 4. **Style + tooling.** Run `cargo fmt` and `cargo clippy --all-targets
    --all-features` before sending patches. Follow the shared
    [`CODE_STYLE.md`](./CODE_STYLE.md) and keep imports ordered/grouped per that
