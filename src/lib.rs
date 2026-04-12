@@ -316,8 +316,7 @@ mod tests {
         .expect("link");
         let value = Value::from(link);
         let encoded = destream_json::encode(value.clone()).expect("encode link value");
-        let decoded: Value =
-            block_on(destream_json::try_decode((), encoded)).expect("decode link");
+        let decoded: Value = block_on(destream_json::try_decode((), encoded)).expect("decode link");
         assert_eq!(decoded, value);
     }
 }
