@@ -249,25 +249,16 @@ impl<'en> en::ToStream<'en> for Value {
 
 impl<'en> en::IntoStream<'en> for Value {
     fn into_stream<E: en::Encoder<'en>>(self, encoder: E) -> Result<E::Ok, E::Error> {
-        use destream::en::EncodeMap;
-
         match self {
             Value::None => encoder.encode_unit(),
             Value::Link(link) => {
+                use destream::en::EncodeMap;
                 let mut map = encoder.encode_map(Some(1))?;
                 map.encode_entry(link.to_string(), Vec::<()>::new())?;
                 map.end()
             }
-            Value::Number(number) => {
-                let mut map = encoder.encode_map(Some(1))?;
-                map.encode_entry(ValueType::Number.path().to_string(), number)?;
-                map.end()
-            }
-            Value::String(string) => {
-                let mut map = encoder.encode_map(Some(1))?;
-                map.encode_entry(ValueType::String.path().to_string(), string)?;
-                map.end()
-            }
+            Value::Number(number) => number.into_stream(encoder),
+            Value::String(string) => string.into_stream(encoder),
         }
     }
 }
@@ -275,7 +266,7 @@ impl<'en> en::IntoStream<'en> for Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use futures::executor::block_on;
+    use futures::{executor::block_on, TryStreamExt};
 
     #[test]
     fn value_from_u64() {
@@ -293,6 +284,22 @@ mod tests {
     }
 
     #[test]
+    fn encode_number_value_as_plain_json_number() {
+        let value = Value::from(42_u64);
+        let encoded = destream_json::encode(value).expect("encode number value");
+        let bytes = block_on(
+            encoded
+                .map_err(|err| err.to_string())
+                .try_fold(Vec::new(), |mut acc, chunk| async move {
+                    acc.extend_from_slice(&chunk);
+                    Ok(acc)
+                }),
+        )
+        .expect("collect encoded number");
+        assert_eq!(bytes, b"42");
+    }
+
+    #[test]
     fn decode_plain_json_number() {
         let stream = destream_json::encode(7_u64).expect("encode plain json number");
         let decoded: Value = block_on(destream_json::try_decode((), stream)).expect("decode");
@@ -306,6 +313,22 @@ mod tests {
         let decoded: Value =
             block_on(destream_json::try_decode((), encoded)).expect("decode string");
         assert_eq!(decoded, value);
+    }
+
+    #[test]
+    fn encode_string_value_as_plain_json_string() {
+        let value = Value::from("hello");
+        let encoded = destream_json::encode(value).expect("encode string value");
+        let bytes = block_on(
+            encoded
+                .map_err(|err| err.to_string())
+                .try_fold(Vec::new(), |mut acc, chunk| async move {
+                    acc.extend_from_slice(&chunk);
+                    Ok(acc)
+                }),
+        )
+        .expect("collect encoded string");
+        assert_eq!(bytes, br#""hello""#);
     }
 
     #[test]
