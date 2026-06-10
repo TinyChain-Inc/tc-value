@@ -6,7 +6,24 @@ state subsystem, and adapters.
 
 ## Current status
 
-- [ ] Stub `Value` enum with initial variants (e.g., `Number`).
-- [ ] Implement numeric support using `number-general`.
-- [ ] Add serde/destream implementations so `Value` can flow across adapters.
-- [ ] Wire unit tests and cross-crate integration tests once the initial API stabilizes.
+- [x] Canonical `Value` enum implemented with variants:
+	- `None`
+	- `Bool`
+	- `Number`
+	- `String`
+	- `Link`
+	- `Map`
+	- `Tuple`
+- [x] `destream`/JSON round-trip support for all variants.
+- [x] Strict bool semantics: JSON booleans decode as `Value::Bool` (not numeric).
+- [x] Unit tests for literal and nested map/tuple round-trips.
+
+## Encoding notes
+
+- `None`, `Bool`, `Number`, and `String` encode as plain JSON literals.
+- `Map` encodes as a plain JSON object of nested `Value`s.
+- `Tuple` encodes as a plain JSON array of nested `Value`s.
+- `Link` encodes as a single-entry map keyed by the link path (v1-compatible form).
+
+Typed value envelopes (`/state/scalar/value/...`) remain accepted where required for
+compatibility, but canonical emission prefers the plain JSON forms above.

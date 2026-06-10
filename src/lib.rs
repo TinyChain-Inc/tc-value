@@ -1,5 +1,6 @@
 //! Core TinyChain value representations (WIP).
 
+use std::collections::BTreeMap;
 use std::str::FromStr;
 
 use crate::class::{Class, NativeClass};
@@ -14,34 +15,52 @@ pub use class::{number_type_from_path, number_type_path};
 pub use number_general::NumberType;
 
 const VALUE_PREFIX: PathLabel = path_label(&["state", "scalar", "value"]);
+const SEGMENT_BOOL: &str = "bool";
 const SEGMENT_LINK: &str = "link";
+const SEGMENT_MAP: &str = "map";
 const SEGMENT_NONE: &str = "none";
 const SEGMENT_NUMBER: &str = "number";
 const SEGMENT_STRING: &str = "string";
+const SEGMENT_TUPLE: &str = "tuple";
+const LABEL_BOOL: Label = label(SEGMENT_BOOL);
 const LABEL_LINK: Label = label(SEGMENT_LINK);
+const LABEL_MAP: Label = label(SEGMENT_MAP);
 const LABEL_NONE: Label = label(SEGMENT_NONE);
 const LABEL_NUMBER: Label = label(SEGMENT_NUMBER);
 const LABEL_STRING: Label = label(SEGMENT_STRING);
+const LABEL_TUPLE: Label = label(SEGMENT_TUPLE);
 
 /// High-level TinyChain value enumeration (stub).
 #[cfg_attr(feature = "serialize", derive(Serialize, Deserialize))]
 #[derive(Clone, Debug, Default, PartialEq)]
 pub enum Value {
+    Bool(bool),
     #[default]
     None,
     Link(Link),
+    Map(BTreeMap<String, Value>),
     Number(Number),
     String(String),
+    Tuple(Vec<Value>),
 }
 
 impl Value {
     pub fn class(&self) -> ValueType {
         match self {
+            Value::Bool(_) => ValueType::Bool,
             Value::None => ValueType::None,
             Value::Link(_) => ValueType::Link,
+            Value::Map(_) => ValueType::Map,
             Value::Number(_) => ValueType::Number,
             Value::String(_) => ValueType::String,
+            Value::Tuple(_) => ValueType::Tuple,
         }
+    }
+}
+
+impl From<bool> for Value {
+    fn from(value: bool) -> Self {
+        Value::Bool(value)
     }
 }
 
@@ -75,6 +94,18 @@ impl From<u64> for Value {
     }
 }
 
+impl From<Vec<Value>> for Value {
+    fn from(value: Vec<Value>) -> Self {
+        Value::Tuple(value)
+    }
+}
+
+impl From<BTreeMap<String, Value>> for Value {
+    fn from(value: BTreeMap<String, Value>) -> Self {
+        Value::Map(value)
+    }
+}
+
 impl From<()> for Value {
     fn from(_: ()) -> Self {
         Value::None
@@ -85,10 +116,13 @@ impl From<()> for Value {
 #[cfg_attr(feature = "serialize", derive(Serialize, Deserialize))]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ValueType {
+    Bool,
     Link,
+    Map,
     None,
     Number,
     String,
+    Tuple,
 }
 
 impl ValueType {
@@ -113,10 +147,13 @@ impl NativeClass for ValueType {
         let segment = Self::from_suffix(path)?;
 
         match segment.as_str() {
+            SEGMENT_BOOL => Some(ValueType::Bool),
             SEGMENT_LINK => Some(ValueType::Link),
+            SEGMENT_MAP => Some(ValueType::Map),
             SEGMENT_NONE => Some(ValueType::None),
             SEGMENT_NUMBER => Some(ValueType::Number),
             SEGMENT_STRING => Some(ValueType::String),
+            SEGMENT_TUPLE => Some(ValueType::Tuple),
             _ => None,
         }
     }
@@ -124,10 +161,13 @@ impl NativeClass for ValueType {
     fn path(&self) -> PathBuf {
         let prefix = PathBuf::from(VALUE_PREFIX);
         match self {
+            ValueType::Bool => prefix.append(LABEL_BOOL),
             ValueType::Link => prefix.append(LABEL_LINK),
+            ValueType::Map => prefix.append(LABEL_MAP),
             ValueType::None => prefix.append(LABEL_NONE),
             ValueType::Number => prefix.append(LABEL_NUMBER),
             ValueType::String => prefix.append(LABEL_STRING),
+            ValueType::Tuple => prefix.append(LABEL_TUPLE),
         }
     }
 }
@@ -157,7 +197,7 @@ impl de::FromStream for Value {
             }
 
             fn visit_bool<E: de::Error>(self, value: bool) -> Result<Self::Value, E> {
-                Ok(Value::Number(Number::from(value)))
+                Ok(Value::Bool(value))
             }
 
             fn visit_i64<E: de::Error>(self, value: i64) -> Result<Self::Value, E> {
@@ -176,6 +216,23 @@ impl de::FromStream for Value {
                 Ok(Value::String(value))
             }
 
+            async fn visit_seq<A: de::SeqAccess>(
+                self,
+                mut seq: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut items = if let Some(size) = seq.size_hint() {
+                    Vec::with_capacity(size)
+                } else {
+                    Vec::new()
+                };
+
+                while let Some(value) = seq.next_element::<Value>(()).await? {
+                    items.push(value);
+                }
+
+                Ok(Value::Tuple(items))
+            }
+
             async fn visit_map<A: de::MapAccess>(
                 self,
                 mut map: A,
@@ -187,6 +244,14 @@ impl de::FromStream for Value {
 
                 if let Ok(path) = key.parse::<PathBuf>() {
                     match ValueType::from_path(&path) {
+                        Some(ValueType::Bool) => {
+                            let value = map.next_value::<bool>(()).await?;
+                            while map.next_key::<de::IgnoredAny>(()).await?.is_some() {
+                                let _ = map.next_value::<de::IgnoredAny>(()).await?;
+                            }
+
+                            return Ok(Value::Bool(value));
+                        }
                         Some(ValueType::Number) => {
                             let number = map.next_value::<Number>(()).await?;
                             // Drain any trailing entries to keep the decoder in sync.
@@ -218,6 +283,22 @@ impl de::FromStream for Value {
 
                             return Ok(Value::Link(link));
                         }
+                        Some(ValueType::Map) => {
+                            let nested = map.next_value::<BTreeMap<String, Value>>(()).await?;
+                            while map.next_key::<de::IgnoredAny>(()).await?.is_some() {
+                                let _ = map.next_value::<de::IgnoredAny>(()).await?;
+                            }
+
+                            return Ok(Value::Map(nested));
+                        }
+                        Some(ValueType::Tuple) => {
+                            let nested = map.next_value::<Vec<Value>>(()).await?;
+                            while map.next_key::<de::IgnoredAny>(()).await?.is_some() {
+                                let _ = map.next_value::<de::IgnoredAny>(()).await?;
+                            }
+
+                            return Ok(Value::Tuple(nested));
+                        }
                         None => {}
                     }
                 }
@@ -230,10 +311,16 @@ impl de::FromStream for Value {
                     return Ok(Value::Link(link));
                 }
 
-                Err(de::Error::invalid_value(
-                    key,
-                    "a known TinyChain value type path",
-                ))
+                let mut object = BTreeMap::new();
+                let first_value = map.next_value::<Value>(()).await?;
+                object.insert(key, first_value);
+
+                while let Some(next_key) = map.next_key::<String>(()).await? {
+                    let value = map.next_value::<Value>(()).await?;
+                    object.insert(next_key, value);
+                }
+
+                Ok(Value::Map(object))
             }
         }
 
@@ -250,6 +337,7 @@ impl<'en> en::ToStream<'en> for Value {
 impl<'en> en::IntoStream<'en> for Value {
     fn into_stream<E: en::Encoder<'en>>(self, encoder: E) -> Result<E::Ok, E::Error> {
         match self {
+            Value::Bool(value) => value.into_stream(encoder),
             Value::None => encoder.encode_unit(),
             Value::Link(link) => {
                 use destream::en::EncodeMap;
@@ -257,8 +345,10 @@ impl<'en> en::IntoStream<'en> for Value {
                 map.encode_entry(link.to_string(), Vec::<()>::new())?;
                 map.end()
             }
+            Value::Map(map) => map.into_stream(encoder),
             Value::Number(number) => number.into_stream(encoder),
             Value::String(string) => string.into_stream(encoder),
+            Value::Tuple(tuple) => tuple.into_stream(encoder),
         }
     }
 }
@@ -307,6 +397,29 @@ mod tests {
     }
 
     #[test]
+    fn decode_plain_json_bool() {
+        let stream = destream_json::encode(true).expect("encode plain json bool");
+        let decoded: Value = block_on(destream_json::try_decode((), stream)).expect("decode");
+        assert_eq!(decoded, Value::Bool(true));
+    }
+
+    #[test]
+    fn encode_bool_value_as_plain_json_bool() {
+        let value = Value::Bool(true);
+        let encoded = destream_json::encode(value).expect("encode bool value");
+        let bytes = block_on(
+            encoded
+                .map_err(|err| err.to_string())
+                .try_fold(Vec::new(), |mut acc, chunk| async move {
+                    acc.extend_from_slice(&chunk);
+                    Ok(acc)
+                }),
+        )
+        .expect("collect encoded bool");
+        assert_eq!(bytes, b"true");
+    }
+
+    #[test]
     fn roundtrip_string_value() {
         let value = Value::from("hello");
         let encoded = destream_json::encode(value.clone()).expect("encode string value");
@@ -340,6 +453,26 @@ mod tests {
         let value = Value::from(link);
         let encoded = destream_json::encode(value.clone()).expect("encode link value");
         let decoded: Value = block_on(destream_json::try_decode((), encoded)).expect("decode link");
+        assert_eq!(decoded, value);
+    }
+
+    #[test]
+    fn roundtrip_tuple_value() {
+        let value = Value::Tuple(vec![Value::Bool(true), Value::from(7_u64), Value::from("x")]);
+        let encoded = destream_json::encode(value.clone()).expect("encode tuple value");
+        let decoded: Value = block_on(destream_json::try_decode((), encoded)).expect("decode tuple");
+        assert_eq!(decoded, value);
+    }
+
+    #[test]
+    fn roundtrip_map_value() {
+        let mut map = BTreeMap::new();
+        map.insert("a".to_string(), Value::Bool(true));
+        map.insert("b".to_string(), Value::from(5_u64));
+
+        let value = Value::Map(map);
+        let encoded = destream_json::encode(value.clone()).expect("encode map value");
+        let decoded: Value = block_on(destream_json::try_decode((), encoded)).expect("decode map");
         assert_eq!(decoded, value);
     }
 }
