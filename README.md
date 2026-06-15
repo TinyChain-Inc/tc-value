@@ -15,7 +15,7 @@ state subsystem, and adapters.
 	- `Map`
 	- `Tuple`
 - [x] `destream`/JSON round-trip support for all variants.
-- [x] Strict bool semantics: JSON booleans decode as `Value::Bool` (not numeric).
+- [x] Bool-as-number semantics: JSON booleans decode as `Value::Number(Number::Bool(...))`.
 - [x] Unit tests for literal and nested map/tuple round-trips.
 
 ## Encoding notes

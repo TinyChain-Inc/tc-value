@@ -15,14 +15,12 @@ pub use class::{number_type_from_path, number_type_path};
 pub use number_general::NumberType;
 
 const VALUE_PREFIX: PathLabel = path_label(&["state", "scalar", "value"]);
-const SEGMENT_BOOL: &str = "bool";
 const SEGMENT_LINK: &str = "link";
 const SEGMENT_MAP: &str = "map";
 const SEGMENT_NONE: &str = "none";
 const SEGMENT_NUMBER: &str = "number";
 const SEGMENT_STRING: &str = "string";
 const SEGMENT_TUPLE: &str = "tuple";
-const LABEL_BOOL: Label = label(SEGMENT_BOOL);
 const LABEL_LINK: Label = label(SEGMENT_LINK);
 const LABEL_MAP: Label = label(SEGMENT_MAP);
 const LABEL_NONE: Label = label(SEGMENT_NONE);
@@ -34,7 +32,6 @@ const LABEL_TUPLE: Label = label(SEGMENT_TUPLE);
 #[cfg_attr(feature = "serialize", derive(Serialize, Deserialize))]
 #[derive(Clone, Debug, Default, PartialEq)]
 pub enum Value {
-    Bool(bool),
     #[default]
     None,
     Link(Link),
@@ -47,7 +44,6 @@ pub enum Value {
 impl Value {
     pub fn class(&self) -> ValueType {
         match self {
-            Value::Bool(_) => ValueType::Bool,
             Value::None => ValueType::None,
             Value::Link(_) => ValueType::Link,
             Value::Map(_) => ValueType::Map,
@@ -60,7 +56,7 @@ impl Value {
 
 impl From<bool> for Value {
     fn from(value: bool) -> Self {
-        Value::Bool(value)
+        Value::Number(Number::from(value))
     }
 }
 
@@ -116,7 +112,6 @@ impl From<()> for Value {
 #[cfg_attr(feature = "serialize", derive(Serialize, Deserialize))]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ValueType {
-    Bool,
     Link,
     Map,
     None,
@@ -147,7 +142,6 @@ impl NativeClass for ValueType {
         let segment = Self::from_suffix(path)?;
 
         match segment.as_str() {
-            SEGMENT_BOOL => Some(ValueType::Bool),
             SEGMENT_LINK => Some(ValueType::Link),
             SEGMENT_MAP => Some(ValueType::Map),
             SEGMENT_NONE => Some(ValueType::None),
@@ -161,7 +155,6 @@ impl NativeClass for ValueType {
     fn path(&self) -> PathBuf {
         let prefix = PathBuf::from(VALUE_PREFIX);
         match self {
-            ValueType::Bool => prefix.append(LABEL_BOOL),
             ValueType::Link => prefix.append(LABEL_LINK),
             ValueType::Map => prefix.append(LABEL_MAP),
             ValueType::None => prefix.append(LABEL_NONE),
@@ -197,7 +190,7 @@ impl de::FromStream for Value {
             }
 
             fn visit_bool<E: de::Error>(self, value: bool) -> Result<Self::Value, E> {
-                Ok(Value::Bool(value))
+                Ok(Value::Number(Number::from(value)))
             }
 
             fn visit_i64<E: de::Error>(self, value: i64) -> Result<Self::Value, E> {
@@ -244,14 +237,6 @@ impl de::FromStream for Value {
 
                 if let Ok(path) = key.parse::<PathBuf>() {
                     match ValueType::from_path(&path) {
-                        Some(ValueType::Bool) => {
-                            let value = map.next_value::<bool>(()).await?;
-                            while map.next_key::<de::IgnoredAny>(()).await?.is_some() {
-                                let _ = map.next_value::<de::IgnoredAny>(()).await?;
-                            }
-
-                            return Ok(Value::Bool(value));
-                        }
                         Some(ValueType::Number) => {
                             let number = map.next_value::<Number>(()).await?;
                             // Drain any trailing entries to keep the decoder in sync.
@@ -337,7 +322,6 @@ impl<'en> en::ToStream<'en> for Value {
 impl<'en> en::IntoStream<'en> for Value {
     fn into_stream<E: en::Encoder<'en>>(self, encoder: E) -> Result<E::Ok, E::Error> {
         match self {
-            Value::Bool(value) => value.into_stream(encoder),
             Value::None => encoder.encode_unit(),
             Value::Link(link) => {
                 use destream::en::EncodeMap;
@@ -400,12 +384,12 @@ mod tests {
     fn decode_plain_json_bool() {
         let stream = destream_json::encode(true).expect("encode plain json bool");
         let decoded: Value = block_on(destream_json::try_decode((), stream)).expect("decode");
-        assert_eq!(decoded, Value::Bool(true));
+        assert_eq!(decoded, Value::Number(Number::Bool(true.into())));
     }
 
     #[test]
     fn encode_bool_value_as_plain_json_bool() {
-        let value = Value::Bool(true);
+        let value = Value::Number(Number::Bool(true.into()));
         let encoded = destream_json::encode(value).expect("encode bool value");
         let bytes = block_on(
             encoded
@@ -458,7 +442,11 @@ mod tests {
 
     #[test]
     fn roundtrip_tuple_value() {
-        let value = Value::Tuple(vec![Value::Bool(true), Value::from(7_u64), Value::from("x")]);
+        let value = Value::Tuple(vec![
+            Value::Number(Number::Bool(true.into())),
+            Value::from(7_u64),
+            Value::from("x"),
+        ]);
         let encoded = destream_json::encode(value.clone()).expect("encode tuple value");
         let decoded: Value = block_on(destream_json::try_decode((), encoded)).expect("decode tuple");
         assert_eq!(decoded, value);
@@ -467,7 +455,10 @@ mod tests {
     #[test]
     fn roundtrip_map_value() {
         let mut map = BTreeMap::new();
-        map.insert("a".to_string(), Value::Bool(true));
+        map.insert(
+            "a".to_string(),
+            Value::Number(Number::Bool(true.into())),
+        );
         map.insert("b".to_string(), Value::from(5_u64));
 
         let value = Value::Map(map);
