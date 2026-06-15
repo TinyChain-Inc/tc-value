@@ -377,14 +377,13 @@ mod tests {
     fn encode_number_value_as_plain_json_number() {
         let value = Value::from(42_u64);
         let encoded = destream_json::encode(value).expect("encode number value");
-        let bytes = block_on(
-            encoded
-                .map_err(|err| err.to_string())
-                .try_fold(Vec::new(), |mut acc, chunk| async move {
-                    acc.extend_from_slice(&chunk);
-                    Ok(acc)
-                }),
-        )
+        let bytes = block_on(encoded.map_err(|err| err.to_string()).try_fold(
+            Vec::new(),
+            |mut acc, chunk| async move {
+                acc.extend_from_slice(&chunk);
+                Ok(acc)
+            },
+        ))
         .expect("collect encoded number");
         assert_eq!(bytes, b"42");
     }
@@ -407,14 +406,13 @@ mod tests {
     fn encode_bool_value_as_plain_json_bool() {
         let value = Value::Bool(true);
         let encoded = destream_json::encode(value).expect("encode bool value");
-        let bytes = block_on(
-            encoded
-                .map_err(|err| err.to_string())
-                .try_fold(Vec::new(), |mut acc, chunk| async move {
-                    acc.extend_from_slice(&chunk);
-                    Ok(acc)
-                }),
-        )
+        let bytes = block_on(encoded.map_err(|err| err.to_string()).try_fold(
+            Vec::new(),
+            |mut acc, chunk| async move {
+                acc.extend_from_slice(&chunk);
+                Ok(acc)
+            },
+        ))
         .expect("collect encoded bool");
         assert_eq!(bytes, b"true");
     }
@@ -432,14 +430,13 @@ mod tests {
     fn encode_string_value_as_plain_json_string() {
         let value = Value::from("hello");
         let encoded = destream_json::encode(value).expect("encode string value");
-        let bytes = block_on(
-            encoded
-                .map_err(|err| err.to_string())
-                .try_fold(Vec::new(), |mut acc, chunk| async move {
-                    acc.extend_from_slice(&chunk);
-                    Ok(acc)
-                }),
-        )
+        let bytes = block_on(encoded.map_err(|err| err.to_string()).try_fold(
+            Vec::new(),
+            |mut acc, chunk| async move {
+                acc.extend_from_slice(&chunk);
+                Ok(acc)
+            },
+        ))
         .expect("collect encoded string");
         assert_eq!(bytes, br#""hello""#);
     }
@@ -458,9 +455,14 @@ mod tests {
 
     #[test]
     fn roundtrip_tuple_value() {
-        let value = Value::Tuple(vec![Value::Bool(true), Value::from(7_u64), Value::from("x")]);
+        let value = Value::Tuple(vec![
+            Value::Bool(true),
+            Value::from(7_u64),
+            Value::from("x"),
+        ]);
         let encoded = destream_json::encode(value.clone()).expect("encode tuple value");
-        let decoded: Value = block_on(destream_json::try_decode((), encoded)).expect("decode tuple");
+        let decoded: Value =
+            block_on(destream_json::try_decode((), encoded)).expect("decode tuple");
         assert_eq!(decoded, value);
     }
 
