@@ -165,6 +165,58 @@ impl NativeClass for ValueType {
     }
 }
 
+/// Decode a typed `/state/scalar/value/...` map entry if `key` is a recognized Value type path.
+///
+/// Returns `Ok(Some(Value))` when `key` is a typed Value path and the corresponding value was
+/// decoded from `map`; otherwise returns `Ok(None)` and leaves the caller to handle the entry.
+pub async fn decode_typed_value_map_entry<A: de::MapAccess>(
+    key: &str,
+    map: &mut A,
+) -> Result<Option<Value>, A::Error> {
+    let Ok(path) = key.parse::<PathBuf>() else {
+        return Ok(None);
+    };
+
+    let Some(value_type) = ValueType::from_path(&path) else {
+        return Ok(None);
+    };
+
+    let value = match value_type {
+        ValueType::Number => {
+            let number = map.next_value::<Number>(()).await?;
+            Value::Number(number)
+        }
+        ValueType::None => {
+            let _ = map.next_value::<de::IgnoredAny>(()).await?;
+            Value::None
+        }
+        ValueType::String => {
+            let string = map.next_value::<String>(()).await?;
+            Value::String(string)
+        }
+        ValueType::Link => {
+            let link_raw = map.next_value::<String>(()).await?;
+            let link = Link::from_str(&link_raw).map_err(|err| de::Error::custom(err.to_string()))?;
+            Value::Link(link)
+        }
+        ValueType::Map => {
+            let nested = map.next_value::<BTreeMap<String, Value>>(()).await?;
+            Value::Map(nested)
+        }
+        ValueType::Tuple => {
+            let nested = map.next_value::<Vec<Value>>(()).await?;
+            Value::Tuple(nested)
+        }
+    };
+
+    // Drain trailing entries to keep decoder state in sync with tolerant v1 map semantics.
+    while map.next_key::<de::IgnoredAny>(()).await?.is_some() {
+        let _ = map.next_value::<de::IgnoredAny>(()).await?;
+    }
+
+    Ok(Some(value))
+}
+
 impl de::FromStream for Value {
     type Context = ();
 
@@ -235,57 +287,8 @@ impl de::FromStream for Value {
                     .await?
                     .ok_or_else(|| de::Error::custom("expected TinyChain type path key"))?;
 
-                if let Ok(path) = key.parse::<PathBuf>() {
-                    match ValueType::from_path(&path) {
-                        Some(ValueType::Number) => {
-                            let number = map.next_value::<Number>(()).await?;
-                            // Drain any trailing entries to keep the decoder in sync.
-                            while map.next_key::<de::IgnoredAny>(()).await?.is_some() {
-                                let _ = map.next_value::<de::IgnoredAny>(()).await?;
-                            }
-
-                            return Ok(Value::Number(number));
-                        }
-                        Some(ValueType::None) => {
-                            let _ = map.next_value::<de::IgnoredAny>(()).await?;
-                            return Ok(Value::None);
-                        }
-                        Some(ValueType::String) => {
-                            let string = map.next_value::<String>(()).await?;
-                            while map.next_key::<de::IgnoredAny>(()).await?.is_some() {
-                                let _ = map.next_value::<de::IgnoredAny>(()).await?;
-                            }
-
-                            return Ok(Value::String(string));
-                        }
-                        Some(ValueType::Link) => {
-                            let link_raw = map.next_value::<String>(()).await?;
-                            let link = Link::from_str(&link_raw)
-                                .map_err(|err| de::Error::custom(err.to_string()))?;
-                            while map.next_key::<de::IgnoredAny>(()).await?.is_some() {
-                                let _ = map.next_value::<de::IgnoredAny>(()).await?;
-                            }
-
-                            return Ok(Value::Link(link));
-                        }
-                        Some(ValueType::Map) => {
-                            let nested = map.next_value::<BTreeMap<String, Value>>(()).await?;
-                            while map.next_key::<de::IgnoredAny>(()).await?.is_some() {
-                                let _ = map.next_value::<de::IgnoredAny>(()).await?;
-                            }
-
-                            return Ok(Value::Map(nested));
-                        }
-                        Some(ValueType::Tuple) => {
-                            let nested = map.next_value::<Vec<Value>>(()).await?;
-                            while map.next_key::<de::IgnoredAny>(()).await?.is_some() {
-                                let _ = map.next_value::<de::IgnoredAny>(()).await?;
-                            }
-
-                            return Ok(Value::Tuple(nested));
-                        }
-                        None => {}
-                    }
+                if let Some(value) = decode_typed_value_map_entry(&key, &mut map).await? {
+                    return Ok(value);
                 }
 
                 if let Ok(link) = Link::from_str(&key) {
