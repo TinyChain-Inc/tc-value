@@ -4,10 +4,9 @@ version = "0.14.0"
 edition = "2021"
 
 [dependencies]
-async-trait = "0.1"
-destream = "0.10"
-hr-id = "0.7"
-number-general = { version = "0.14", default-features = false, features = ["stream"] }
+destream = { path = "../deps/destream", version = "0.10" }
+hr-id = { path = "../deps/hr-id", version = "0.7" }
+number-general = { path = "../deps/number-general", version = "0.14", default-features = false, features = ["stream"] }
 pathlink = { path = "../deps/pathlink", default-features = false }
 serde = { version = "1", features = ["derive"], optional = true }
 
@@ -20,5 +19,7 @@ serialize = [
 ]
 
 [dev-dependencies]
-destream_json = { version = "0.15", default-features = false }
+bytes = "1"
+destream_json = { path = "../deps/destream_json", version = "0.15", default-features = false }
 futures = "0.3"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
