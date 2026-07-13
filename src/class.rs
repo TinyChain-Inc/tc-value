@@ -15,7 +15,7 @@ const LABEL_16: Label = label("16");
 const LABEL_32: Label = label("32");
 const LABEL_64: Label = label("64");
 
-/// Minimal TinyChain class markers for transitional crates.
+/// Minimal TinyChain class markers.
 pub trait Class: fmt::Debug + Sized {}
 
 /// Native (Rust) implementations of TinyChain classes.
@@ -85,9 +85,8 @@ pub fn number_type_path(dtype: &NumberType) -> PathBuf {
     }
 }
 
-// TODO: When `number-general` lives in this workspace, replace these bit-size
-// suffix matchers with a shared helper so the path construction logic stays in
-// one place.
+// Keep bit-size suffix path assembly local until number-general exposes a
+// shared helper for this mapping.
 fn append_complex_path(mut prefix: PathBuf, ct: ComplexType) -> PathBuf {
     prefix = prefix.append(LABEL_COMPLEX);
     match ct {

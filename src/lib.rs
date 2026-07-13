@@ -235,7 +235,8 @@ pub async fn decode_typed_value_map_entry<A: de::MapAccess>(
         }
         ValueType::Link => {
             let link_raw = map.next_value::<String>(()).await?;
-            let link = Link::from_str(&link_raw).map_err(|err| de::Error::custom(err.to_string()))?;
+            let link =
+                Link::from_str(&link_raw).map_err(|err| de::Error::custom(err.to_string()))?;
             Value::Link(link)
         }
         ValueType::Tuple => {
@@ -479,11 +480,9 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn decode_plain_json_map_fails_closed() {
-        let stream = destream_json::encode(std::collections::BTreeMap::from([(
-            "a".to_string(),
-            1_u64,
-        )]))
-        .expect("encode plain json map");
+        let stream =
+            destream_json::encode(std::collections::BTreeMap::from([("a".to_string(), 1_u64)]))
+                .expect("encode plain json map");
 
         let decoded: Result<Value, _> = destream_json::try_decode((), stream).await;
         assert!(decoded.is_err());
