@@ -488,3 +488,140 @@ mod tests {
         assert!(decoded.is_err());
     }
 }
+
+// ─── safecast impls for request parsing ────────────────────────────────
+
+use hr_id::Id;
+use safecast::TryCastFrom;
+
+impl<T> TryCastFrom<Value> for Vec<T>
+where
+    T: TryCastFrom<Value>,
+{
+    fn can_cast_from(value: &Value) -> bool {
+        match value {
+            Value::Tuple(tuple) => tuple.iter().all(T::can_cast_from),
+            _ => T::can_cast_from(value),
+        }
+    }
+
+    fn opt_cast_from(value: Value) -> Option<Self> {
+        match value {
+            Value::Tuple(tuple) => tuple.into_iter().map(T::opt_cast_from).collect(),
+            _ => Some(vec![T::opt_cast_from(value)?]),
+        }
+    }
+}
+
+impl TryCastFrom<Value> for String {
+    fn can_cast_from(value: &Value) -> bool {
+        matches!(value, Value::String(_))
+    }
+
+    fn opt_cast_from(value: Value) -> Option<Self> {
+        match value {
+            Value::String(s) => Some(s),
+            _ => None,
+        }
+    }
+}
+
+impl TryCastFrom<Value> for Id {
+    fn can_cast_from(value: &Value) -> bool {
+        match value {
+            Value::String(s) => <Id as TryCastFrom<String>>::can_cast_from(s),
+            _ => false,
+        }
+    }
+
+    fn opt_cast_from(value: Value) -> Option<Self> {
+        match value {
+            Value::String(s) => Id::opt_cast_from(s),
+            _ => None,
+        }
+    }
+}
+
+impl<T1, T2> TryCastFrom<Value> for (T1, T2)
+where
+    T1: TryCastFrom<Value>,
+    T2: TryCastFrom<Value>,
+{
+    fn can_cast_from(value: &Value) -> bool {
+        let Value::Tuple(pair) = value else {
+            return false;
+        };
+        pair.len() == 2 && T1::can_cast_from(&pair[0]) && T2::can_cast_from(&pair[1])
+    }
+
+    fn opt_cast_from(value: Value) -> Option<Self> {
+        let Value::Tuple(pair) = value else {
+            return None;
+        };
+        if pair.len() != 2 {
+            return None;
+        }
+        Some((
+            T1::opt_cast_from(pair[0].clone())?,
+            T2::opt_cast_from(pair[1].clone())?,
+        ))
+    }
+}
+
+impl TryCastFrom<Value> for bool {
+    fn can_cast_from(value: &Value) -> bool {
+        matches!(value, Value::Number(_) | Value::None)
+    }
+
+    fn opt_cast_from(value: Value) -> Option<Self> {
+        match value {
+            Value::Number(n) => {
+                use safecast::CastFrom;
+                Some(u64::cast_from(n) != 0)
+            }
+            Value::None => Some(false),
+            _ => None,
+        }
+    }
+}
+
+impl TryCastFrom<Value> for std::ops::Bound<Value> {
+    fn can_cast_from(_value: &Value) -> bool {
+        true
+    }
+
+    fn opt_cast_from(value: Value) -> Option<Self> {
+        match value {
+            Value::None => Some(std::ops::Bound::Unbounded),
+            other => Some(std::ops::Bound::Included(other)),
+        }
+    }
+}
+
+impl TryCastFrom<Value> for ValueType {
+    fn can_cast_from(value: &Value) -> bool {
+        Self::opt_cast_from_ref(value).is_some()
+    }
+
+    fn opt_cast_from(value: Value) -> Option<Self> {
+        Self::opt_cast_from_ref(&value)
+    }
+}
+
+impl ValueType {
+    fn opt_cast_from_ref(value: &Value) -> Option<Self> {
+        match value {
+            Value::String(s) => {
+                let path = pathlink::PathBuf::from_str(s).ok()?;
+                NativeClass::from_path(&path)
+            }
+            _ => None,
+        }
+    }
+}
+
+impl safecast::CastFrom<ValueType> for Value {
+    fn cast_from(dtype: ValueType) -> Self {
+        Value::String(dtype.path().to_string())
+    }
+}
