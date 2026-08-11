@@ -481,14 +481,22 @@ impl TryCastFrom<Value> for bool {
 }
 
 impl TryCastFrom<Value> for std::ops::Bound<Value> {
-    fn can_cast_from(_value: &Value) -> bool {
-        true
+    fn can_cast_from(value: &Value) -> bool {
+        Self::opt_cast_from(value.clone()).is_some()
     }
 
     fn opt_cast_from(value: Value) -> Option<Self> {
         match value {
             Value::None => Some(std::ops::Bound::Unbounded),
-            other => Some(std::ops::Bound::Included(other)),
+            Value::Tuple(mut pair) if pair.len() == 2 => {
+                let value = pair.pop()?;
+                match pair.pop()? {
+                    Value::String(tag) if tag == "in" => Some(std::ops::Bound::Included(value)),
+                    Value::String(tag) if tag == "ex" => Some(std::ops::Bound::Excluded(value)),
+                    _ => None,
+                }
+            }
+            _ => None,
         }
     }
 }
@@ -523,9 +531,45 @@ impl safecast::CastFrom<ValueType> for Value {
 
 #[cfg(test)]
 mod tests {
+    use std::ops::Bound;
+
     use futures::TryStreamExt;
 
     use super::*;
+
+    #[test]
+    fn cast_tagged_bounds() {
+        assert_eq!(
+            Bound::<Value>::opt_cast_from(Value::None),
+            Some(Bound::Unbounded)
+        );
+        assert_eq!(
+            Bound::<Value>::opt_cast_from(Value::Tuple(vec![
+                Value::from("in"),
+                Value::from(1_u64),
+            ])),
+            Some(Bound::Included(Value::from(1_u64)))
+        );
+        assert_eq!(
+            Bound::<Value>::opt_cast_from(Value::Tuple(vec![
+                Value::from("ex"),
+                Value::from(2_u64),
+            ])),
+            Some(Bound::Excluded(Value::from(2_u64)))
+        );
+    }
+
+    #[test]
+    fn reject_untagged_bounds() {
+        assert_eq!(Bound::<Value>::opt_cast_from(Value::from(1_u64)), None);
+        assert_eq!(
+            Bound::<Value>::opt_cast_from(Value::Tuple(vec![
+                Value::from("unknown"),
+                Value::from(1_u64),
+            ])),
+            None
+        );
+    }
 
     async fn encode_json_bytes<T>(value: T) -> Vec<u8>
     where
