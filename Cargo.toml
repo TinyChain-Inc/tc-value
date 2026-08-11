@@ -4,6 +4,7 @@ version = "0.14.0"
 edition = "2021"
 
 [dependencies]
+collate = { path = "../deps/collate" }
 destream = { path = "../deps/destream", version = "0.10" }
 hr-id = { path = "../deps/hr-id", version = "0.7" }
 number-general = { path = "../deps/number-general", version = "0.14", default-features = false, features = ["stream"] }

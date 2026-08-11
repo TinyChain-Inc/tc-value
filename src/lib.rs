@@ -1,14 +1,18 @@
+#![forbid(unsafe_code)]
+
 //! Core TinyChain value representations (WIP).
 
 use std::cmp::Ordering;
 use std::str::FromStr;
 
-use crate::class::{Class, NativeClass};
+use collate::{Collate, Collator};
 use destream::{de, en, IntoStream};
-use number_general::{Number, NumberInstance};
+use number_general::{Number, NumberCollator};
 use pathlink::{label, path_label, Label, Link, PathBuf, PathLabel, PathSegment};
 #[cfg(feature = "serialize")]
 use serde::{Deserialize, Serialize};
+
+use crate::class::{Class, NativeClass};
 pub mod class;
 
 pub use class::{number_type_from_path, number_type_path};
@@ -40,45 +44,34 @@ pub enum Value {
 
 impl Eq for Value {}
 
-impl PartialOrd for Value {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
+/// Defines the canonical collation order for [`Value`].
+#[derive(Copy, Clone, Default, Eq, PartialEq)]
+pub struct ValueCollator {
+    link: Collator<Link>,
+    number: NumberCollator,
+    string: Collator<String>,
 }
 
-impl Ord for Value {
-    fn cmp(&self, other: &Self) -> Ordering {
-        fn tag(value: &Value) -> u8 {
-            match value {
-                Value::None => 0,
-                Value::Number(_) => 1,
-                Value::String(_) => 2,
-                Value::Link(_) => 3,
-                Value::Tuple(_) => 4,
-            }
-        }
+impl Collate for ValueCollator {
+    type Value = Value;
 
-        let tag_ord = tag(self).cmp(&tag(other));
-        if tag_ord != Ordering::Equal {
-            return tag_ord;
-        }
-
-        match (self, other) {
+    fn cmp(&self, left: &Value, right: &Value) -> Ordering {
+        match (left, right) {
             (Value::None, Value::None) => Ordering::Equal,
-            (Value::Number(left), Value::Number(right)) if left == right => Ordering::Equal,
-            (Value::Number(left), Value::Number(right)) => {
-                let class_ord = left.class().cmp(&right.class());
-                if class_ord != Ordering::Equal {
-                    return class_ord;
+            (Value::Link(left), Value::Link(right)) => self.link.cmp(left, right),
+            (Value::Number(left), Value::Number(right)) => self.number.cmp(left, right),
+            (Value::String(left), Value::String(right)) => self.string.cmp(left, right),
+            (Value::Tuple(left), Value::Tuple(right)) => {
+                for (left, right) in left.iter().zip(right) {
+                    match self.cmp(left, right) {
+                        Ordering::Equal => {}
+                        ordering => return ordering,
+                    }
                 }
 
-                // Use a stable textual ordering for non-equal numeric values to guarantee a total order.
-                left.to_string().cmp(&right.to_string())
+                left.len().cmp(&right.len())
             }
-            (Value::String(left), Value::String(right)) => left.cmp(right),
-            (Value::Link(left), Value::Link(right)) => left.to_string().cmp(&right.to_string()),
-            (Value::Tuple(left), Value::Tuple(right)) => left.cmp(right),
-            _ => unreachable!("Value tag ordering must align with variant matching"),
+            (left, right) => left.class().cmp(&right.class()),
         }
     }
 }
@@ -154,6 +147,28 @@ pub enum ValueType {
     Tuple,
 }
 
+impl Ord for ValueType {
+    fn cmp(&self, other: &Self) -> Ordering {
+        fn rank(value_type: &ValueType) -> u8 {
+            match value_type {
+                ValueType::None => 0,
+                ValueType::Number => 1,
+                ValueType::String => 2,
+                ValueType::Link => 3,
+                ValueType::Tuple => 4,
+            }
+        }
+
+        rank(self).cmp(&rank(other))
+    }
+}
+
+impl PartialOrd for ValueType {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
 impl ValueType {
     fn from_suffix(path: &[PathSegment]) -> Option<&PathSegment> {
         let prefix_len = VALUE_PREFIX[..].len();
@@ -197,10 +212,12 @@ impl NativeClass for ValueType {
     }
 }
 
-/// Decode a typed `/state/scalar/value/...` map entry if `key` is a recognized Value type path.
+/// Decode a typed `/state/scalar/value/...` map entry if `key` is a recognized
+/// Value type path.
 ///
-/// Returns `Ok(Some(Value))` when `key` is a typed Value path and the corresponding value was
-/// decoded from `map`; otherwise returns `Ok(None)` and leaves the caller to handle the entry.
+/// Returns `Ok(Some(Value))` when `key` is a typed Value path and the
+/// corresponding value was decoded from `map`; otherwise returns `Ok(None)` and
+/// leaves the caller to handle the entry.
 pub async fn decode_typed_value_map_entry<A: de::MapAccess>(
     key: &str,
     map: &mut A,
@@ -245,7 +262,8 @@ pub async fn decode_typed_value_map_entry<A: de::MapAccess>(
         }
     };
 
-    // Drain trailing entries to keep decoder state in sync with tolerant v1 map semantics.
+    // Drain trailing entries to keep decoder state in sync with tolerant v1 map
+    // semantics.
     while map.next_key::<de::IgnoredAny>(()).await?.is_some() {
         let _ = map.next_value::<de::IgnoredAny>(()).await?;
     }
@@ -363,129 +381,6 @@ impl<'en> en::IntoStream<'en> for Value {
             Value::String(string) => string.into_stream(encoder),
             Value::Tuple(tuple) => tuple.into_stream(encoder),
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use futures::TryStreamExt;
-
-    async fn encode_json_bytes<T>(value: T) -> Vec<u8>
-    where
-        T: for<'en> en::IntoStream<'en>,
-    {
-        destream_json::encode(value)
-            .expect("encode json value")
-            .map_err(|err| err.to_string())
-            .try_fold(Vec::new(), |mut acc, chunk| async move {
-                acc.extend_from_slice(&chunk);
-                Ok(acc)
-            })
-            .await
-            .expect("collect encoded value")
-    }
-
-    async fn decode_json_value<T>(
-        stream: impl futures::Stream<Item = Result<bytes::Bytes, String>> + Send + Unpin,
-    ) -> T
-    where
-        T: de::FromStream<Context = ()>,
-    {
-        destream_json::try_decode((), stream)
-            .await
-            .expect("decode value")
-    }
-
-    #[test]
-    fn value_from_u64() {
-        let value = Value::from(123_u64);
-        assert!(matches!(value, Value::Number(Number::UInt(_))));
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn roundtrip_json_number_value() {
-        let value = Value::from(42_u64);
-        let encoded = destream_json::encode(value.clone()).expect("encode number value");
-        let decoded: Value = decode_json_value(encoded.map_err(|err| err.to_string())).await;
-        assert_eq!(decoded, value);
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn encode_number_value_as_plain_json_number() {
-        let value = Value::from(42_u64);
-        let bytes = encode_json_bytes(value).await;
-        assert_eq!(bytes, b"42");
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn decode_plain_json_number() {
-        let stream = destream_json::encode(7_u64).expect("encode plain json number");
-        let decoded: Value = decode_json_value(stream.map_err(|err| err.to_string())).await;
-        assert_eq!(decoded, Value::from(7_u64));
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn decode_plain_json_bool() {
-        let stream = destream_json::encode(true).expect("encode plain json bool");
-        let decoded: Value = decode_json_value(stream.map_err(|err| err.to_string())).await;
-        assert_eq!(decoded, Value::Number(Number::Bool(true.into())));
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn encode_bool_value_as_plain_json_bool() {
-        let value = Value::Number(Number::Bool(true.into()));
-        let bytes = encode_json_bytes(value).await;
-        assert_eq!(bytes, b"true");
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn roundtrip_string_value() {
-        let value = Value::from("hello");
-        let encoded = destream_json::encode(value.clone()).expect("encode string value");
-        let decoded: Value = decode_json_value(encoded.map_err(|err| err.to_string())).await;
-        assert_eq!(decoded, value);
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn encode_string_value_as_plain_json_string() {
-        let value = Value::from("hello");
-        let bytes = encode_json_bytes(value).await;
-        assert_eq!(bytes, br#""hello""#);
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn roundtrip_link_value() {
-        let link = Link::from_str(
-            &PathBuf::from(path_label(&["state", "scalar", "ref", "if"])).to_string(),
-        )
-        .expect("link");
-        let value = Value::from(link);
-        let encoded = destream_json::encode(value.clone()).expect("encode link value");
-        let decoded: Value = decode_json_value(encoded.map_err(|err| err.to_string())).await;
-        assert_eq!(decoded, value);
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn roundtrip_tuple_value() {
-        let value = Value::Tuple(vec![
-            Value::Number(Number::Bool(true.into())),
-            Value::from(7_u64),
-            Value::from("x"),
-        ]);
-        let encoded = destream_json::encode(value.clone()).expect("encode tuple value");
-        let decoded: Value = decode_json_value(encoded.map_err(|err| err.to_string())).await;
-        assert_eq!(decoded, value);
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn decode_plain_json_map_fails_closed() {
-        let stream =
-            destream_json::encode(std::collections::BTreeMap::from([("a".to_string(), 1_u64)]))
-                .expect("encode plain json map");
-
-        let decoded: Result<Value, _> = destream_json::try_decode((), stream).await;
-        assert!(decoded.is_err());
     }
 }
 
@@ -623,5 +518,161 @@ impl ValueType {
 impl safecast::CastFrom<ValueType> for Value {
     fn cast_from(dtype: ValueType) -> Self {
         Value::String(dtype.path().to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use futures::TryStreamExt;
+
+    use super::*;
+
+    async fn encode_json_bytes<T>(value: T) -> Vec<u8>
+    where
+        T: for<'en> en::IntoStream<'en>,
+    {
+        destream_json::encode(value)
+            .expect("encode json value")
+            .map_err(|err| err.to_string())
+            .try_fold(Vec::new(), |mut acc, chunk| async move {
+                acc.extend_from_slice(&chunk);
+                Ok(acc)
+            })
+            .await
+            .expect("collect encoded value")
+    }
+
+    async fn decode_json_value<T>(
+        stream: impl futures::Stream<Item = Result<bytes::Bytes, String>> + Send + Unpin,
+    ) -> T
+    where
+        T: de::FromStream<Context = ()>,
+    {
+        destream_json::try_decode((), stream)
+            .await
+            .expect("decode value")
+    }
+
+    #[test]
+    fn value_from_u64() {
+        let value = Value::from(123_u64);
+        assert!(matches!(value, Value::Number(Number::UInt(_))));
+    }
+
+    #[test]
+    fn value_collator_delegates_numeric_ordering() {
+        let collator = ValueCollator::default();
+
+        assert_eq!(
+            collator.cmp(&Value::from(9_000_u64), &Value::from(11_000_u64)),
+            Ordering::Less
+        );
+
+        let integer = Value::from(Number::from(9_i64));
+        let float = Value::from(Number::from(9.5_f64));
+        assert_eq!(collator.cmp(&integer, &float), Ordering::Less);
+    }
+
+    #[test]
+    fn value_collator_delegates_complex_ordering() {
+        let collator = ValueCollator::default();
+        let five = Value::from(Number::from(number_general::Complex::from([3_f32, 4_f32])));
+        let ten = Value::from(Number::from(number_general::Complex::from([6_f32, 8_f32])));
+
+        assert_eq!(collator.cmp(&five, &ten), Ordering::Less);
+    }
+
+    #[test]
+    fn value_collator_recurses_through_tuples() {
+        let collator = ValueCollator::default();
+        let left = Value::Tuple(vec![Value::from("same"), Value::from(9_000_u64)]);
+        let right = Value::Tuple(vec![Value::from("same"), Value::from(11_000_u64)]);
+
+        assert_eq!(collator.cmp(&left, &right), Ordering::Less);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn roundtrip_json_number_value() {
+        let value = Value::from(42_u64);
+        let encoded = destream_json::encode(value.clone()).expect("encode number value");
+        let decoded: Value = decode_json_value(encoded.map_err(|err| err.to_string())).await;
+        assert_eq!(decoded, value);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn encode_number_value_as_plain_json_number() {
+        let value = Value::from(42_u64);
+        let bytes = encode_json_bytes(value).await;
+        assert_eq!(bytes, b"42");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn decode_plain_json_number() {
+        let stream = destream_json::encode(7_u64).expect("encode plain json number");
+        let decoded: Value = decode_json_value(stream.map_err(|err| err.to_string())).await;
+        assert_eq!(decoded, Value::from(7_u64));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn decode_plain_json_bool() {
+        let stream = destream_json::encode(true).expect("encode plain json bool");
+        let decoded: Value = decode_json_value(stream.map_err(|err| err.to_string())).await;
+        assert_eq!(decoded, Value::Number(Number::Bool(true.into())));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn encode_bool_value_as_plain_json_bool() {
+        let value = Value::Number(Number::Bool(true.into()));
+        let bytes = encode_json_bytes(value).await;
+        assert_eq!(bytes, b"true");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn roundtrip_string_value() {
+        let value = Value::from("hello");
+        let encoded = destream_json::encode(value.clone()).expect("encode string value");
+        let decoded: Value = decode_json_value(encoded.map_err(|err| err.to_string())).await;
+        assert_eq!(decoded, value);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn encode_string_value_as_plain_json_string() {
+        let value = Value::from("hello");
+        let bytes = encode_json_bytes(value).await;
+        assert_eq!(bytes, br#""hello""#);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn roundtrip_link_value() {
+        let link = Link::from_str(
+            &PathBuf::from(path_label(&["state", "scalar", "ref", "cond"])).to_string(),
+        )
+        .expect("link");
+        let value = Value::from(link);
+        let encoded = destream_json::encode(value.clone()).expect("encode link value");
+        let decoded: Value = decode_json_value(encoded.map_err(|err| err.to_string())).await;
+        assert_eq!(decoded, value);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn roundtrip_tuple_value() {
+        let value = Value::Tuple(vec![
+            Value::Number(Number::Bool(true.into())),
+            Value::from(7_u64),
+            Value::from("x"),
+        ]);
+        let encoded = destream_json::encode(value.clone()).expect("encode tuple value");
+        let decoded: Value = decode_json_value(encoded.map_err(|err| err.to_string())).await;
+        assert_eq!(decoded, value);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn decode_plain_json_map_fails_closed() {
+        let stream =
+            destream_json::encode(std::collections::BTreeMap::from([("a".to_string(), 1_u64)]))
+                .expect("encode plain json map");
+
+        let decoded: Result<Value, _> = destream_json::try_decode((), stream).await;
+        assert!(decoded.is_err());
     }
 }

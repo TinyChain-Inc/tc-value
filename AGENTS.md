@@ -17,6 +17,10 @@ other primitives are identified, serialized, and round-tripped through the IR.
 - Reuse shared primitives (`Number` from `number-general`, `TCRef`, common tuple
   types). Do not introduce crate-specific wrapper structs unless they are
   reusable by `tc-state`, `tc-collection`, and adapters.
+- `Value` has intrinsic equality but no intrinsic ordering. All ordered storage,
+  ranges, and stream merges must use `ValueCollator`, which delegates numbers to
+  `NumberCollator` and recursively collates tuples. Do not implement `Ord` or
+  `PartialOrd` for `Value`, compare serialized forms, or use `Collator<Value>`.
 - Avoid feature-flag forks. The same `Value` definitions must compile on every
   target (kernel, PyO3, WASM) so the control plane stays deterministic.
 
