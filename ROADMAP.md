@@ -1,5 +1,7 @@
 # tc-value Roadmap
 
+> **Non-normative:** this file tracks unimplemented work and cannot override the canonical contracts linked from the root `AGENTS.md`.
+
 This crate will house the canonical TinyChain `Value` enum and supporting
 serialization/helpers. Track work here so IR/state/adapters stay in sync.
 

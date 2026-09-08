@@ -1,8 +1,8 @@
 # tc-value Agent Notes
 
-`tc-value` defines the canonical scalar envelope shared by every TinyChain crate.
-Treat it as the single source of truth for how numbers, strings, tuples, and
-other primitives are identified, serialized, and round-tripped through the IR.
+`tc-value` defines the canonical scalar values shared by every TinyChain crate.
+Treat it as the single source of truth for `None`, bytes, links, numbers,
+strings, and tuples.
 
 ## Modeling rules
 
@@ -14,8 +14,8 @@ other primitives are identified, serialized, and round-tripped through the IR.
 - Match paths via `PathLabel` slices instead of ad-hoc string comparisons. Add
   new labels/segments beside the types they describe and reuse `path_matches`
   helpers so every caller enforces TinyChain `Id` validation consistently.
-- Reuse shared primitives (`Number` from `number-general`, `TCRef`, common tuple
-  types). Do not introduce crate-specific wrapper structs unless they are
+- Reuse shared primitives such as `Number` from `number-general`. Do not
+  introduce crate-specific wrapper structs unless they are
   reusable by `tc-state`, `tc-collection`, and adapters.
 - `Value` has intrinsic equality but no intrinsic ordering. All ordered storage,
   ranges, and stream merges must use `ValueCollator`, which delegates numbers to
@@ -26,15 +26,13 @@ other primitives are identified, serialized, and round-tripped through the IR.
 
 ## Serialization and wire format
 
-- `de::FromStream`/`en::IntoStream` are the canonical encoding. Keep them in sync
-  with the JSON contract used by HTTP/WebSocket adapters: a map whose single key
-  is the value type path. Do not add alternate envelopes or ad-hoc verbs.
+- `de::FromStream`/`en::IntoStream` are the canonical encoding. Keep them
+  symmetric and do not add alternate envelopes.
 - Normalize scalar coercions through `number_general::Number`. If you add string,
   tuple, or binary support, route all parsing through shared helper modules so
   clients cannot mint incompatible representations.
-- When introducing a new scalar, add round-trip tests that decode both the
-  canonical typed envelope and the plain JSON literal (where applicable) so
-  adapters remain forgiving without diverging from the TinyChain schema.
+- When introducing a new scalar, add canonical round-trip, malformed-input,
+  collation, size, and type-path tests as applicable.
 
 ## Testing and coordination
 
@@ -45,6 +43,5 @@ other primitives are identified, serialized, and round-tripped through the IR.
   scalar surface changes. `tc-ir`, `tc-state`, and `tc-server` rely on this crate
   staying in lockstep; flag any breaking changes in their respective `AGENTS.md`
   before merging.
-- `destream` is the canonical codec here. Only use `serde` for strictly bounded
-  payloads (e.g., URI query strings) or legacy fixtures, and document those
-  exceptions inline so they can be removed later.
+- `destream` is the canonical codec here. A concrete transport may enable an
+  adapter feature, but transport compatibility logic does not belong in Value.

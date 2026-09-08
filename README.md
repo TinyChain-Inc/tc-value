@@ -1,29 +1,32 @@
 # tc-value
 
-Core value representations shared across TinyChain crates. This crate will house
-the canonical `Value` enum (numbers, strings, tuples, etc.) used by the IR,
-state subsystem, and adapters.
+`tc-value` owns TinyChain's canonical scalar value vocabulary. It is independent
+of host state, transactions, collections, and transport adapters.
 
-## Current status
+## Values
 
-- [x] Canonical `Value` enum implemented with variants:
-	- `None`
-	- `Bool`
-	- `Number`
-	- `String`
-	- `Link`
-	- `Map`
-	- `Tuple`
-- [x] `destream`/JSON round-trip support for all variants.
-- [x] Bool-as-number semantics: JSON booleans decode as `Value::Number(Number::Bool(...))`.
-- [x] Unit tests for literal and nested map/tuple round-trips.
+`Value` has six variants:
 
-## Encoding notes
+- `None`
+- `Bytes(Arc<[u8]>)`
+- `Link`
+- `Number` (including booleans)
+- `String`
+- `Tuple`
 
-- `None`, `Bool`, `Number`, and `String` encode as plain JSON literals.
-- `Map` encodes as a plain JSON object of nested `Value`s.
-- `Tuple` encodes as a plain JSON array of nested `Value`s.
-- `Link` encodes as a single-entry map keyed by the link path (v1-compatible form).
+Maps belong to the IR/state collection structure rather than `Value`. Booleans
+use `Number::Bool`; there is no separate `Value::Bool` variant.
 
-Typed value envelopes (`/state/scalar/value/...`) remain accepted where required for
-compatibility, but canonical emission prefers the plain JSON forms above.
+Each variant owns its canonical type URI, size accounting, collation,
+conversions, semantic traversal, and symmetric `destream` codec. Bytes are an
+ordinary bounded value and are used at real byte boundaries such as raw WASM
+installation; they are not a package or server-specific payload.
+
+Plain literals use their natural wire form where one exists. Typed values use
+the canonical `/state/scalar/value/...` representation required for an
+unambiguous round trip. Readers accept the form emitted by writers; this crate
+does not maintain compatibility envelopes.
+
+```bash
+cargo test --all-targets --all-features
+```
