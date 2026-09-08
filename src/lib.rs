@@ -6,6 +6,7 @@ use std::cmp::Ordering;
 use std::str::FromStr;
 use std::sync::Arc;
 
+use async_hash::{Digest, Hash, Output};
 use collate::{Collate, Collator};
 use destream::{de, en, IntoStream};
 use number_general::{Number, NumberCollator};
@@ -47,6 +48,25 @@ pub enum Value {
 }
 
 impl Eq for Value {}
+
+impl<D: Digest> Hash<D> for Value {
+    fn hash(self) -> Output<D> {
+        Hash::<D>::hash(&self)
+    }
+}
+
+impl<D: Digest> Hash<D> for &Value {
+    fn hash(self) -> Output<D> {
+        match self {
+            Value::None => async_hash::default_hash::<D>(),
+            Value::Bytes(bytes) => D::digest(bytes),
+            Value::Link(link) => Hash::<D>::hash(link),
+            Value::Number(number) => Hash::<D>::hash(*number),
+            Value::String(string) => Hash::<D>::hash(string),
+            Value::Tuple(tuple) => Hash::<D>::hash(tuple),
+        }
+    }
+}
 
 impl get_size::GetSize for Value {
     fn get_size(&self) -> usize {
