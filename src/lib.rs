@@ -4,6 +4,7 @@
 
 use std::cmp::Ordering;
 use std::str::FromStr;
+use std::sync::Arc;
 
 use collate::{Collate, Collator};
 use destream::{de, en, IntoStream};
@@ -19,11 +20,13 @@ pub use class::{number_type_from_path, number_type_path};
 pub use number_general::NumberType;
 
 const VALUE_PREFIX: PathLabel = path_label(&["state", "scalar", "value"]);
+const SEGMENT_BYTES: &str = "bytes";
 const SEGMENT_LINK: &str = "link";
 const SEGMENT_NONE: &str = "none";
 const SEGMENT_NUMBER: &str = "number";
 const SEGMENT_STRING: &str = "string";
 const SEGMENT_TUPLE: &str = "tuple";
+const LABEL_BYTES: Label = label(SEGMENT_BYTES);
 const LABEL_LINK: Label = label(SEGMENT_LINK);
 const LABEL_NONE: Label = label(SEGMENT_NONE);
 const LABEL_NUMBER: Label = label(SEGMENT_NUMBER);
@@ -36,6 +39,7 @@ const LABEL_TUPLE: Label = label(SEGMENT_TUPLE);
 pub enum Value {
     #[default]
     None,
+    Bytes(Arc<[u8]>),
     Link(Link),
     Number(Number),
     String(String),
@@ -44,9 +48,23 @@ pub enum Value {
 
 impl Eq for Value {}
 
+impl get_size::GetSize for Value {
+    fn get_size(&self) -> usize {
+        match self {
+            Self::None => 0,
+            Self::Bytes(value) => value.get_size(),
+            Self::Link(value) => value.get_size(),
+            Self::Number(value) => value.get_size(),
+            Self::String(value) => value.get_size(),
+            Self::Tuple(value) => value.get_size(),
+        }
+    }
+}
+
 /// Defines the canonical collation order for [`Value`].
 #[derive(Copy, Clone, Default, Eq, PartialEq)]
 pub struct ValueCollator {
+    bytes: Collator<Arc<[u8]>>,
     link: Collator<Link>,
     number: NumberCollator,
     string: Collator<String>,
@@ -58,6 +76,7 @@ impl Collate for ValueCollator {
     fn cmp(&self, left: &Value, right: &Value) -> Ordering {
         match (left, right) {
             (Value::None, Value::None) => Ordering::Equal,
+            (Value::Bytes(left), Value::Bytes(right)) => self.bytes.cmp(left, right),
             (Value::Link(left), Value::Link(right)) => self.link.cmp(left, right),
             (Value::Number(left), Value::Number(right)) => self.number.cmp(left, right),
             (Value::String(left), Value::String(right)) => self.string.cmp(left, right),
@@ -80,6 +99,7 @@ impl Value {
     pub fn class(&self) -> ValueType {
         match self {
             Value::None => ValueType::None,
+            Value::Bytes(_) => ValueType::Bytes,
             Value::Link(_) => ValueType::Link,
             Value::Number(_) => ValueType::Number,
             Value::String(_) => ValueType::String,
@@ -91,6 +111,24 @@ impl Value {
 impl From<bool> for Value {
     fn from(value: bool) -> Self {
         Value::Number(Number::from(value))
+    }
+}
+
+impl From<Arc<[u8]>> for Value {
+    fn from(value: Arc<[u8]>) -> Self {
+        Value::Bytes(value)
+    }
+}
+
+impl From<Vec<u8>> for Value {
+    fn from(value: Vec<u8>) -> Self {
+        Value::Bytes(value.into())
+    }
+}
+
+impl From<bytes::Bytes> for Value {
+    fn from(value: bytes::Bytes) -> Self {
+        Value::Bytes(value.to_vec().into())
     }
 }
 
@@ -140,6 +178,7 @@ impl From<()> for Value {
 #[cfg_attr(feature = "serialize", derive(Serialize, Deserialize))]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ValueType {
+    Bytes,
     Link,
     None,
     Number,
@@ -152,10 +191,11 @@ impl Ord for ValueType {
         fn rank(value_type: &ValueType) -> u8 {
             match value_type {
                 ValueType::None => 0,
-                ValueType::Number => 1,
-                ValueType::String => 2,
-                ValueType::Link => 3,
-                ValueType::Tuple => 4,
+                ValueType::Bytes => 1,
+                ValueType::Number => 2,
+                ValueType::String => 3,
+                ValueType::Link => 4,
+                ValueType::Tuple => 5,
             }
         }
 
@@ -191,6 +231,7 @@ impl NativeClass for ValueType {
         let segment = Self::from_suffix(path)?;
 
         match segment.as_str() {
+            SEGMENT_BYTES => Some(ValueType::Bytes),
             SEGMENT_LINK => Some(ValueType::Link),
             SEGMENT_NONE => Some(ValueType::None),
             SEGMENT_NUMBER => Some(ValueType::Number),
@@ -203,6 +244,7 @@ impl NativeClass for ValueType {
     fn path(&self) -> PathBuf {
         let prefix = PathBuf::from(VALUE_PREFIX);
         match self {
+            ValueType::Bytes => prefix.append(LABEL_BYTES),
             ValueType::Link => prefix.append(LABEL_LINK),
             ValueType::None => prefix.append(LABEL_NONE),
             ValueType::Number => prefix.append(LABEL_NUMBER),
@@ -238,6 +280,10 @@ pub async fn decode_typed_value_map_entry<A: de::MapAccess>(
     };
 
     let value = match value_type {
+        ValueType::Bytes => {
+            let bytes = map.next_value::<bytes::Bytes>(()).await?;
+            Value::Bytes(bytes.to_vec().into())
+        }
         ValueType::Number => {
             let number = map.next_value::<Number>(()).await?;
             Value::Number(number)
@@ -371,6 +417,15 @@ impl<'en> en::IntoStream<'en> for Value {
     fn into_stream<E: en::Encoder<'en>>(self, encoder: E) -> Result<E::Ok, E::Error> {
         match self {
             Value::None => encoder.encode_unit(),
+            Value::Bytes(bytes) => {
+                use destream::en::EncodeMap;
+                let mut map = encoder.encode_map(Some(1))?;
+                map.encode_entry(
+                    ValueType::Bytes.path().to_string(),
+                    bytes::Bytes::from_owner(bytes),
+                )?;
+                map.end()
+            }
             Value::Link(link) => {
                 use destream::en::EncodeMap;
                 let mut map = encoder.encode_map(Some(1))?;
@@ -416,6 +471,32 @@ impl TryCastFrom<Value> for String {
     fn opt_cast_from(value: Value) -> Option<Self> {
         match value {
             Value::String(s) => Some(s),
+            _ => None,
+        }
+    }
+}
+
+impl TryCastFrom<Value> for Arc<[u8]> {
+    fn can_cast_from(value: &Value) -> bool {
+        matches!(value, Value::Bytes(_))
+    }
+
+    fn opt_cast_from(value: Value) -> Option<Self> {
+        match value {
+            Value::Bytes(bytes) => Some(bytes),
+            _ => None,
+        }
+    }
+}
+
+impl TryCastFrom<Value> for bytes::Bytes {
+    fn can_cast_from(value: &Value) -> bool {
+        matches!(value, Value::Bytes(_))
+    }
+
+    fn opt_cast_from(value: Value) -> Option<Self> {
+        match value {
+            Value::Bytes(bytes) => Some(Self::from_owner(bytes)),
             _ => None,
         }
     }
@@ -639,6 +720,14 @@ mod tests {
     async fn roundtrip_json_number_value() {
         let value = Value::from(42_u64);
         let encoded = destream_json::encode(value.clone()).expect("encode number value");
+        let decoded: Value = decode_json_value(encoded.map_err(|err| err.to_string())).await;
+        assert_eq!(decoded, value);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn roundtrip_json_bytes_value() {
+        let value = Value::Bytes(Arc::from([0_u8, 1, 2, 255]));
+        let encoded = destream_json::encode(value.clone()).expect("encode bytes value");
         let decoded: Value = decode_json_value(encoded.map_err(|err| err.to_string())).await;
         assert_eq!(decoded, value);
     }
