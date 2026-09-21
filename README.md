@@ -1,5 +1,9 @@
 # tc-value
 
+Borrowed `ToStream` encoding delegates through native values without cloning
+strings or tuple trees. Byte values retain shared ownership of their payload;
+owned and borrowed encoding produce the same representation.
+
 `tc-value` owns TinyChain's canonical scalar value vocabulary. It is independent
 of host state, transactions, collections, and transport adapters.
 

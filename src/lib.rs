@@ -429,7 +429,27 @@ impl de::FromStream for Value {
 
 impl<'en> en::ToStream<'en> for Value {
     fn to_stream<E: en::Encoder<'en>>(&'en self, encoder: E) -> Result<E::Ok, E::Error> {
-        self.clone().into_stream(encoder)
+        match self {
+            Value::None => encoder.encode_unit(),
+            Value::Bytes(bytes) => {
+                use destream::en::EncodeMap;
+                let mut map = encoder.encode_map(Some(1))?;
+                map.encode_entry(
+                    ValueType::Bytes.path().to_string(),
+                    bytes::Bytes::from_owner(Arc::clone(bytes)),
+                )?;
+                map.end()
+            }
+            Value::Link(link) => {
+                use destream::en::EncodeMap;
+                let mut map = encoder.encode_map(Some(1))?;
+                map.encode_entry(link.to_string(), Vec::<()>::new())?;
+                map.end()
+            }
+            Value::Number(number) => number.into_stream(encoder),
+            Value::String(string) => string.into_stream(encoder),
+            Value::Tuple(tuple) => tuple.into_stream(encoder),
+        }
     }
 }
 
@@ -672,9 +692,9 @@ mod tests {
         );
     }
 
-    async fn encode_json_bytes<T>(value: T) -> Vec<u8>
+    async fn encode_json_bytes<'en, T>(value: T) -> Vec<u8>
     where
-        T: for<'en> en::IntoStream<'en>,
+        T: en::IntoStream<'en> + 'en,
     {
         destream_json::encode(value)
             .expect("encode json value")
@@ -702,6 +722,29 @@ mod tests {
     fn value_from_u64() {
         let value = Value::from(123_u64);
         assert!(matches!(value, Value::Number(Number::UInt(_))));
+    }
+
+    #[tokio::test]
+    async fn borrowed_encoding_matches_owned_values() {
+        let values = vec![
+            Value::None,
+            Value::Bytes(Arc::from([0_u8, 1, 255])),
+            Value::Link("/example".parse().unwrap()),
+            Value::from(true),
+            Value::from(42_u64),
+            Value::from("quoted \"value\""),
+            Value::Tuple(vec![]),
+            Value::Tuple(vec![Value::from("x".repeat(200_000))]),
+        ];
+        for value in values
+            .iter()
+            .chain(std::iter::once(&Value::Tuple(values.clone())))
+        {
+            assert_eq!(
+                encode_json_bytes(value).await,
+                encode_json_bytes(value.clone()).await
+            );
+        }
     }
 
     #[test]
