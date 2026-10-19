@@ -1,20 +1,16 @@
 #![forbid(unsafe_code)]
 
-//! Core TinyChain value representations (WIP).
+//! Canonical TinyChain values with iterative ownership and streaming.
 
 use std::cmp::Ordering;
 use std::str::FromStr;
 use std::sync::Arc;
 
-use async_hash::{Digest, Hash, Output};
-use collate::{Collate, Collator};
-use destream::{de, en, IntoStream};
-use number_general::{Number, NumberCollator};
+use number_general::Number;
 use pathlink::{label, path_label, Label, Link, PathBuf, PathLabel, PathSegment};
-#[cfg(feature = "serialize")]
-use serde::{Deserialize, Serialize};
 
 use crate::class::{Class, NativeClass};
+mod allocation;
 pub mod class;
 
 pub use class::{number_type_from_path, number_type_path};
@@ -34,168 +30,62 @@ const LABEL_NUMBER: Label = label(SEGMENT_NUMBER);
 const LABEL_STRING: Label = label(SEGMENT_STRING);
 const LABEL_TUPLE: Label = label(SEGMENT_TUPLE);
 
-/// High-level TinyChain value enumeration (stub).
-#[cfg_attr(feature = "serialize", derive(Serialize, Deserialize))]
-#[derive(Clone, Debug, Default, PartialEq)]
-pub enum Value {
-    #[default]
-    None,
-    Bytes(Arc<[u8]>),
-    Link(Link),
-    Number(Number),
-    String(String),
-    Tuple(Vec<Value>),
-}
+mod owned;
+mod stream;
 
-impl Eq for Value {}
+pub use owned::{Value, ValueCollator, ValueKind};
+pub use stream::decode_typed_value;
 
-impl<D: Digest> Hash<D> for Value {
-    fn hash(self) -> Output<D> {
-        Hash::<D>::hash(&self)
-    }
-}
-
-impl<D: Digest> Hash<D> for &Value {
-    fn hash(self) -> Output<D> {
-        match self {
-            Value::None => async_hash::default_hash::<D>(),
-            Value::Bytes(bytes) => D::digest(bytes),
-            Value::Link(link) => Hash::<D>::hash(link),
-            Value::Number(number) => Hash::<D>::hash(*number),
-            Value::String(string) => Hash::<D>::hash(string),
-            Value::Tuple(tuple) => Hash::<D>::hash(tuple),
-        }
-    }
-}
-
-impl get_size::GetSize for Value {
-    fn get_size(&self) -> usize {
-        match self {
-            Self::None => 0,
-            Self::Bytes(value) => value.get_size(),
-            Self::Link(value) => value.get_size(),
-            Self::Number(value) => value.get_size(),
-            Self::String(value) => value.get_size(),
-            Self::Tuple(value) => value.get_size(),
-        }
-    }
-}
-
-/// Defines the canonical collation order for [`Value`].
-#[derive(Copy, Clone, Default, Eq, PartialEq)]
-pub struct ValueCollator {
-    bytes: Collator<Arc<[u8]>>,
-    link: Collator<Link>,
-    number: NumberCollator,
-    string: Collator<String>,
-}
-
-impl Collate for ValueCollator {
-    type Value = Value;
-
-    fn cmp(&self, left: &Value, right: &Value) -> Ordering {
-        match (left, right) {
-            (Value::None, Value::None) => Ordering::Equal,
-            (Value::Bytes(left), Value::Bytes(right)) => self.bytes.cmp(left, right),
-            (Value::Link(left), Value::Link(right)) => self.link.cmp(left, right),
-            (Value::Number(left), Value::Number(right)) => self.number.cmp(left, right),
-            (Value::String(left), Value::String(right)) => self.string.cmp(left, right),
-            (Value::Tuple(left), Value::Tuple(right)) => {
-                for (left, right) in left.iter().zip(right) {
-                    match self.cmp(left, right) {
-                        Ordering::Equal => {}
-                        ordering => return ordering,
-                    }
-                }
-
-                left.len().cmp(&right.len())
+macro_rules! value_from {
+    ($($ty:ty => $kind:ident),* $(,)?) => {$ (
+        impl From<$ty> for Value {
+            fn from(value: $ty) -> Self {
+                ValueKind::$kind(value).into()
             }
-            (left, right) => left.class().cmp(&right.class()),
         }
-    }
+    )*};
 }
 
-impl Value {
-    pub fn class(&self) -> ValueType {
-        match self {
-            Value::None => ValueType::None,
-            Value::Bytes(_) => ValueType::Bytes,
-            Value::Link(_) => ValueType::Link,
-            Value::Number(_) => ValueType::Number,
-            Value::String(_) => ValueType::String,
-            Value::Tuple(_) => ValueType::Tuple,
-        }
-    }
+value_from! {
+    Arc<[u8]> => Bytes,
+    Number => Number,
+    Link => Link,
+    String => String,
+    Vec<Value> => Tuple,
 }
 
 impl From<bool> for Value {
     fn from(value: bool) -> Self {
-        Value::Number(Number::from(value))
+        Number::from(value).into()
     }
 }
-
-impl From<Arc<[u8]>> for Value {
-    fn from(value: Arc<[u8]>) -> Self {
-        Value::Bytes(value)
-    }
-}
-
-impl From<Vec<u8>> for Value {
-    fn from(value: Vec<u8>) -> Self {
-        Value::Bytes(value.into())
-    }
-}
-
-impl From<bytes::Bytes> for Value {
-    fn from(value: bytes::Bytes) -> Self {
-        Value::Bytes(value.to_vec().into())
-    }
-}
-
-impl From<Number> for Value {
-    fn from(n: Number) -> Self {
-        Value::Number(n)
-    }
-}
-
-impl From<Link> for Value {
-    fn from(link: Link) -> Self {
-        Value::Link(link)
-    }
-}
-
-impl From<String> for Value {
-    fn from(value: String) -> Self {
-        Value::String(value)
-    }
-}
-
-impl From<&str> for Value {
-    fn from(value: &str) -> Self {
-        Value::String(value.to_string())
-    }
-}
-
 impl From<u64> for Value {
     fn from(value: u64) -> Self {
-        Value::Number(Number::from(value))
+        Number::from(value).into()
     }
 }
-
-impl From<Vec<Value>> for Value {
-    fn from(value: Vec<Value>) -> Self {
-        Value::Tuple(value)
+impl From<Vec<u8>> for Value {
+    fn from(value: Vec<u8>) -> Self {
+        ValueKind::Bytes(value.into()).into()
     }
 }
-
+impl From<bytes::Bytes> for Value {
+    fn from(value: bytes::Bytes) -> Self {
+        value.to_vec().into()
+    }
+}
+impl From<&str> for Value {
+    fn from(value: &str) -> Self {
+        value.to_owned().into()
+    }
+}
 impl From<()> for Value {
     fn from(_: ()) -> Self {
-        Value::None
+        Self::default()
     }
 }
 
 /// Value type paths (URI-based type declarations).
-#[cfg_attr(feature = "serialize", derive(Serialize, Deserialize))]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ValueType {
     Bytes,
@@ -274,211 +164,6 @@ impl NativeClass for ValueType {
     }
 }
 
-/// Decode a typed `/state/scalar/value/...` map entry if `key` is a recognized
-/// Value type path.
-///
-/// Returns `Ok(Some(Value))` when `key` is a typed Value path and the
-/// corresponding value was decoded from `map`; otherwise returns `Ok(None)` and
-/// leaves the caller to handle the entry.
-pub async fn decode_typed_value_map_entry<A: de::MapAccess>(
-    key: &str,
-    map: &mut A,
-) -> Result<Option<Value>, A::Error> {
-    let Ok(path) = key.parse::<PathBuf>() else {
-        return Ok(None);
-    };
-
-    let Some(value_type) = ValueType::from_path(&path) else {
-        let prefix_len = VALUE_PREFIX[..].len();
-        if path.len() == prefix_len + 1 && path[..prefix_len] == VALUE_PREFIX[..] {
-            return Err(de::Error::custom(format!(
-                "unsupported value type path {path}"
-            )));
-        }
-
-        return Ok(None);
-    };
-
-    let value = match value_type {
-        ValueType::Bytes => {
-            let bytes = map.next_value::<bytes::Bytes>(()).await?;
-            Value::Bytes(bytes.to_vec().into())
-        }
-        ValueType::Number => {
-            let number = map.next_value::<Number>(()).await?;
-            Value::Number(number)
-        }
-        ValueType::None => {
-            let _ = map.next_value::<de::IgnoredAny>(()).await?;
-            Value::None
-        }
-        ValueType::String => {
-            let string = map.next_value::<String>(()).await?;
-            Value::String(string)
-        }
-        ValueType::Link => {
-            let link_raw = map.next_value::<String>(()).await?;
-            let link =
-                Link::from_str(&link_raw).map_err(|err| de::Error::custom(err.to_string()))?;
-            Value::Link(link)
-        }
-        ValueType::Tuple => {
-            let nested = map.next_value::<Vec<Value>>(()).await?;
-            Value::Tuple(nested)
-        }
-    };
-
-    // Drain trailing entries to keep decoder state in sync with tolerant v1 map
-    // semantics.
-    while map.next_key::<de::IgnoredAny>(()).await?.is_some() {
-        let _ = map.next_value::<de::IgnoredAny>(()).await?;
-    }
-
-    Ok(Some(value))
-}
-
-impl de::FromStream for Value {
-    type Context = ();
-
-    async fn from_stream<D: de::Decoder>(
-        _context: Self::Context,
-        decoder: &mut D,
-    ) -> Result<Self, D::Error> {
-        struct ValueVisitor;
-
-        impl de::Visitor for ValueVisitor {
-            type Value = Value;
-
-            fn expecting() -> &'static str {
-                "a TinyChain scalar value"
-            }
-
-            fn visit_none<E: de::Error>(self) -> Result<Self::Value, E> {
-                Ok(Value::None)
-            }
-
-            fn visit_unit<E: de::Error>(self) -> Result<Self::Value, E> {
-                Ok(Value::None)
-            }
-
-            fn visit_bool<E: de::Error>(self, value: bool) -> Result<Self::Value, E> {
-                Ok(Value::Number(Number::from(value)))
-            }
-
-            fn visit_i64<E: de::Error>(self, value: i64) -> Result<Self::Value, E> {
-                Ok(Value::Number(Number::from(value)))
-            }
-
-            fn visit_u64<E: de::Error>(self, value: u64) -> Result<Self::Value, E> {
-                Ok(Value::Number(Number::from(value)))
-            }
-
-            fn visit_f64<E: de::Error>(self, value: f64) -> Result<Self::Value, E> {
-                Ok(Value::Number(Number::from(value)))
-            }
-
-            fn visit_string<E: de::Error>(self, value: String) -> Result<Self::Value, E> {
-                Ok(Value::String(value))
-            }
-
-            async fn visit_seq<A: de::SeqAccess>(
-                self,
-                mut seq: A,
-            ) -> Result<Self::Value, A::Error> {
-                let mut items = if let Some(size) = seq.size_hint() {
-                    Vec::with_capacity(size)
-                } else {
-                    Vec::new()
-                };
-
-                while let Some(value) = seq.next_element::<Value>(()).await? {
-                    items.push(value);
-                }
-
-                Ok(Value::Tuple(items))
-            }
-
-            async fn visit_map<A: de::MapAccess>(
-                self,
-                mut map: A,
-            ) -> Result<Self::Value, A::Error> {
-                let key = map
-                    .next_key::<String>(())
-                    .await?
-                    .ok_or_else(|| de::Error::custom("expected TinyChain type path key"))?;
-
-                if let Some(value) = decode_typed_value_map_entry(&key, &mut map).await? {
-                    return Ok(value);
-                }
-
-                if let Ok(link) = Link::from_str(&key) {
-                    let _ = map.next_value::<de::IgnoredAny>(()).await?;
-                    while map.next_key::<de::IgnoredAny>(()).await?.is_some() {
-                        let _ = map.next_value::<de::IgnoredAny>(()).await?;
-                    }
-                    return Ok(Value::Link(link));
-                }
-
-                Err(de::Error::custom("map values are not supported"))
-            }
-        }
-
-        decoder.decode_any(ValueVisitor).await
-    }
-}
-
-impl<'en> en::ToStream<'en> for Value {
-    fn to_stream<E: en::Encoder<'en>>(&'en self, encoder: E) -> Result<E::Ok, E::Error> {
-        match self {
-            Value::None => encoder.encode_unit(),
-            Value::Bytes(bytes) => {
-                use destream::en::EncodeMap;
-                let mut map = encoder.encode_map(Some(1))?;
-                map.encode_entry(
-                    ValueType::Bytes.path().to_string(),
-                    bytes::Bytes::from_owner(Arc::clone(bytes)),
-                )?;
-                map.end()
-            }
-            Value::Link(link) => {
-                use destream::en::EncodeMap;
-                let mut map = encoder.encode_map(Some(1))?;
-                map.encode_entry(link.to_string(), Vec::<()>::new())?;
-                map.end()
-            }
-            Value::Number(number) => number.into_stream(encoder),
-            Value::String(string) => string.into_stream(encoder),
-            Value::Tuple(tuple) => tuple.into_stream(encoder),
-        }
-    }
-}
-
-impl<'en> en::IntoStream<'en> for Value {
-    fn into_stream<E: en::Encoder<'en>>(self, encoder: E) -> Result<E::Ok, E::Error> {
-        match self {
-            Value::None => encoder.encode_unit(),
-            Value::Bytes(bytes) => {
-                use destream::en::EncodeMap;
-                let mut map = encoder.encode_map(Some(1))?;
-                map.encode_entry(
-                    ValueType::Bytes.path().to_string(),
-                    bytes::Bytes::from_owner(bytes),
-                )?;
-                map.end()
-            }
-            Value::Link(link) => {
-                use destream::en::EncodeMap;
-                let mut map = encoder.encode_map(Some(1))?;
-                map.encode_entry(link.to_string(), Vec::<()>::new())?;
-                map.end()
-            }
-            Value::Number(number) => number.into_stream(encoder),
-            Value::String(string) => string.into_stream(encoder),
-            Value::Tuple(tuple) => tuple.into_stream(encoder),
-        }
-    }
-}
-
 // ─── safecast impls for request parsing ────────────────────────────────
 
 use hr_id::Id;
@@ -489,28 +174,28 @@ where
     T: TryCastFrom<Value>,
 {
     fn can_cast_from(value: &Value) -> bool {
-        match value {
-            Value::Tuple(tuple) => tuple.iter().all(T::can_cast_from),
+        match value.kind() {
+            ValueKind::Tuple(tuple) => tuple.iter().all(T::can_cast_from),
             _ => T::can_cast_from(value),
         }
     }
 
     fn opt_cast_from(value: Value) -> Option<Self> {
-        match value {
-            Value::Tuple(tuple) => tuple.into_iter().map(T::opt_cast_from).collect(),
-            _ => Some(vec![T::opt_cast_from(value)?]),
+        match value.into_kind() {
+            ValueKind::Tuple(tuple) => tuple.into_iter().map(T::opt_cast_from).collect(),
+            kind => Some(vec![T::opt_cast_from(kind.into())?]),
         }
     }
 }
 
 impl TryCastFrom<Value> for String {
     fn can_cast_from(value: &Value) -> bool {
-        matches!(value, Value::String(_))
+        matches!(value.kind(), ValueKind::String(_))
     }
 
     fn opt_cast_from(value: Value) -> Option<Self> {
-        match value {
-            Value::String(s) => Some(s),
+        match value.into_kind() {
+            ValueKind::String(s) => Some(s),
             _ => None,
         }
     }
@@ -518,12 +203,12 @@ impl TryCastFrom<Value> for String {
 
 impl TryCastFrom<Value> for Arc<[u8]> {
     fn can_cast_from(value: &Value) -> bool {
-        matches!(value, Value::Bytes(_))
+        matches!(value.kind(), ValueKind::Bytes(_))
     }
 
     fn opt_cast_from(value: Value) -> Option<Self> {
-        match value {
-            Value::Bytes(bytes) => Some(bytes),
+        match value.into_kind() {
+            ValueKind::Bytes(bytes) => Some(bytes),
             _ => None,
         }
     }
@@ -531,12 +216,12 @@ impl TryCastFrom<Value> for Arc<[u8]> {
 
 impl TryCastFrom<Value> for bytes::Bytes {
     fn can_cast_from(value: &Value) -> bool {
-        matches!(value, Value::Bytes(_))
+        matches!(value.kind(), ValueKind::Bytes(_))
     }
 
     fn opt_cast_from(value: Value) -> Option<Self> {
-        match value {
-            Value::Bytes(bytes) => Some(Self::from_owner(bytes)),
+        match value.into_kind() {
+            ValueKind::Bytes(bytes) => Some(Self::from_owner(bytes)),
             _ => None,
         }
     }
@@ -544,15 +229,15 @@ impl TryCastFrom<Value> for bytes::Bytes {
 
 impl TryCastFrom<Value> for Id {
     fn can_cast_from(value: &Value) -> bool {
-        match value {
-            Value::String(s) => <Id as TryCastFrom<String>>::can_cast_from(s),
+        match value.kind() {
+            ValueKind::String(s) => <Id as TryCastFrom<String>>::can_cast_from(s),
             _ => false,
         }
     }
 
     fn opt_cast_from(value: Value) -> Option<Self> {
-        match value {
-            Value::String(s) => Id::opt_cast_from(s),
+        match value.into_kind() {
+            ValueKind::String(s) => Id::opt_cast_from(s),
             _ => None,
         }
     }
@@ -564,38 +249,39 @@ where
     T2: TryCastFrom<Value>,
 {
     fn can_cast_from(value: &Value) -> bool {
-        let Value::Tuple(pair) = value else {
+        let ValueKind::Tuple(pair) = value.kind() else {
             return false;
         };
         pair.len() == 2 && T1::can_cast_from(&pair[0]) && T2::can_cast_from(&pair[1])
     }
 
     fn opt_cast_from(value: Value) -> Option<Self> {
-        let Value::Tuple(pair) = value else {
+        let ValueKind::Tuple(pair) = value.into_kind() else {
             return None;
         };
         if pair.len() != 2 {
             return None;
         }
+        let mut pair = pair.into_iter();
         Some((
-            T1::opt_cast_from(pair[0].clone())?,
-            T2::opt_cast_from(pair[1].clone())?,
+            T1::opt_cast_from(pair.next()?)?,
+            T2::opt_cast_from(pair.next()?)?,
         ))
     }
 }
 
 impl TryCastFrom<Value> for bool {
     fn can_cast_from(value: &Value) -> bool {
-        matches!(value, Value::Number(_) | Value::None)
+        matches!(value.kind(), ValueKind::Number(_) | ValueKind::None)
     }
 
     fn opt_cast_from(value: Value) -> Option<Self> {
-        match value {
-            Value::Number(n) => {
+        match value.into_kind() {
+            ValueKind::Number(n) => {
                 use safecast::CastFrom;
                 Some(u64::cast_from(n) != 0)
             }
-            Value::None => Some(false),
+            ValueKind::None => Some(false),
             _ => None,
         }
     }
@@ -607,13 +293,13 @@ impl TryCastFrom<Value> for std::ops::Bound<Value> {
     }
 
     fn opt_cast_from(value: Value) -> Option<Self> {
-        match value {
-            Value::None => Some(std::ops::Bound::Unbounded),
-            Value::Tuple(mut pair) if pair.len() == 2 => {
+        match value.into_kind() {
+            ValueKind::None => Some(std::ops::Bound::Unbounded),
+            ValueKind::Tuple(mut pair) if pair.len() == 2 => {
                 let value = pair.pop()?;
-                match pair.pop()? {
-                    Value::String(tag) if tag == "in" => Some(std::ops::Bound::Included(value)),
-                    Value::String(tag) if tag == "ex" => Some(std::ops::Bound::Excluded(value)),
+                match pair.pop()?.into_kind() {
+                    ValueKind::String(tag) if tag == "in" => Some(std::ops::Bound::Included(value)),
+                    ValueKind::String(tag) if tag == "ex" => Some(std::ops::Bound::Excluded(value)),
                     _ => None,
                 }
             }
@@ -634,8 +320,8 @@ impl TryCastFrom<Value> for ValueType {
 
 impl ValueType {
     fn opt_cast_from_ref(value: &Value) -> Option<Self> {
-        match value {
-            Value::String(s) => {
+        match value.kind() {
+            ValueKind::String(s) => {
                 let path = pathlink::PathBuf::from_str(s).ok()?;
                 NativeClass::from_path(&path)
             }
@@ -646,7 +332,7 @@ impl ValueType {
 
 impl safecast::CastFrom<ValueType> for Value {
     fn cast_from(dtype: ValueType) -> Self {
-        Value::String(dtype.path().to_string())
+        Value::from(dtype.path().to_string())
     }
 }
 
@@ -654,6 +340,8 @@ impl safecast::CastFrom<ValueType> for Value {
 mod tests {
     use std::ops::Bound;
 
+    use collate::Collate;
+    use destream::{de, en};
     use futures::TryStreamExt;
 
     use super::*;
@@ -661,21 +349,19 @@ mod tests {
     #[test]
     fn cast_tagged_bounds() {
         assert_eq!(
-            Bound::<Value>::opt_cast_from(Value::None),
+            Bound::<Value>::opt_cast_from(Value::default()),
             Some(Bound::Unbounded)
         );
         assert_eq!(
-            Bound::<Value>::opt_cast_from(Value::Tuple(vec![
-                Value::from("in"),
-                Value::from(1_u64),
-            ])),
+            Bound::<Value>::opt_cast_from(Value::from(
+                vec![Value::from("in"), Value::from(1_u64),]
+            )),
             Some(Bound::Included(Value::from(1_u64)))
         );
         assert_eq!(
-            Bound::<Value>::opt_cast_from(Value::Tuple(vec![
-                Value::from("ex"),
-                Value::from(2_u64),
-            ])),
+            Bound::<Value>::opt_cast_from(Value::from(
+                vec![Value::from("ex"), Value::from(2_u64),]
+            )),
             Some(Bound::Excluded(Value::from(2_u64)))
         );
     }
@@ -684,7 +370,7 @@ mod tests {
     fn reject_untagged_bounds() {
         assert_eq!(Bound::<Value>::opt_cast_from(Value::from(1_u64)), None);
         assert_eq!(
-            Bound::<Value>::opt_cast_from(Value::Tuple(vec![
+            Bound::<Value>::opt_cast_from(Value::from(vec![
                 Value::from("unknown"),
                 Value::from(1_u64),
             ])),
@@ -721,30 +407,7 @@ mod tests {
     #[test]
     fn value_from_u64() {
         let value = Value::from(123_u64);
-        assert!(matches!(value, Value::Number(Number::UInt(_))));
-    }
-
-    #[tokio::test]
-    async fn borrowed_encoding_matches_owned_values() {
-        let values = vec![
-            Value::None,
-            Value::Bytes(Arc::from([0_u8, 1, 255])),
-            Value::Link("/example".parse().unwrap()),
-            Value::from(true),
-            Value::from(42_u64),
-            Value::from("quoted \"value\""),
-            Value::Tuple(vec![]),
-            Value::Tuple(vec![Value::from("x".repeat(200_000))]),
-        ];
-        for value in values
-            .iter()
-            .chain(std::iter::once(&Value::Tuple(values.clone())))
-        {
-            assert_eq!(
-                encode_json_bytes(value).await,
-                encode_json_bytes(value.clone()).await
-            );
-        }
+        assert!(matches!(value.kind(), ValueKind::Number(Number::UInt(_))));
     }
 
     #[test]
@@ -773,93 +436,84 @@ mod tests {
     #[test]
     fn value_collator_recurses_through_tuples() {
         let collator = ValueCollator::default();
-        let left = Value::Tuple(vec![Value::from("same"), Value::from(9_000_u64)]);
-        let right = Value::Tuple(vec![Value::from("same"), Value::from(11_000_u64)]);
+        let left = Value::from(vec![Value::from("same"), Value::from(9_000_u64)]);
+        let right = Value::from(vec![Value::from("same"), Value::from(11_000_u64)]);
 
         assert_eq!(collator.cmp(&left, &right), Ordering::Less);
     }
 
-    #[tokio::test(flavor = "multi_thread")]
-    async fn roundtrip_json_number_value() {
-        let value = Value::from(42_u64);
-        let encoded = destream_json::encode(value.clone()).expect("encode number value");
-        let decoded: Value = decode_json_value(encoded.map_err(|err| err.to_string())).await;
-        assert_eq!(decoded, value);
-    }
+    #[tokio::test(flavor = "current_thread")]
+    async fn json_value_cases() {
+        let cases: Vec<(&str, Value, Option<&[u8]>)> = vec![
+            ("number", Value::from(42_u64), Some(b"42")),
+            ("literal number", Value::from(7_u64), Some(b"7")),
+            (
+                "bool",
+                Value::from(Number::Bool(true.into())),
+                Some(b"true"),
+            ),
+            ("string", Value::from("hello"), Some(br#""hello""#)),
+            ("bytes", Value::from(Arc::from([0_u8, 1, 2, 255])), None),
+            (
+                "link",
+                Value::from(
+                    Link::from_str(
+                        &PathBuf::from(path_label(&["state", "scalar", "ref", "cond"])).to_string(),
+                    )
+                    .unwrap(),
+                ),
+                None,
+            ),
+            (
+                "tuple",
+                Value::from(vec![
+                    Value::from(true),
+                    Value::from(7_u64),
+                    Value::from("x"),
+                ]),
+                None,
+            ),
+        ];
+        for (name, value, literal) in &cases {
+            let encoded = encode_json_bytes(value).await;
+            assert_eq!(
+                encoded,
+                encode_json_bytes(value.clone()).await,
+                "{name}: ownership"
+            );
+            if let Some(literal) = literal {
+                assert_eq!(encoded, *literal, "{name}: wire");
+                let decoded: Value = decode_json_value(futures::stream::iter([Ok(
+                    bytes::Bytes::copy_from_slice(literal),
+                )]))
+                .await;
+                assert_eq!(&decoded, value, "{name}: literal decoding");
+            }
+            let decoded: Value =
+                decode_json_value(futures::stream::iter([Ok(bytes::Bytes::from(encoded))])).await;
+            assert_eq!(&decoded, value, "{name}: round trip");
+        }
 
-    #[tokio::test(flavor = "multi_thread")]
-    async fn roundtrip_json_bytes_value() {
-        let value = Value::Bytes(Arc::from([0_u8, 1, 2, 255]));
-        let encoded = destream_json::encode(value.clone()).expect("encode bytes value");
-        let decoded: Value = decode_json_value(encoded.map_err(|err| err.to_string())).await;
-        assert_eq!(decoded, value);
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn encode_number_value_as_plain_json_number() {
-        let value = Value::from(42_u64);
-        let bytes = encode_json_bytes(value).await;
-        assert_eq!(bytes, b"42");
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn decode_plain_json_number() {
-        let stream = destream_json::encode(7_u64).expect("encode plain json number");
-        let decoded: Value = decode_json_value(stream.map_err(|err| err.to_string())).await;
-        assert_eq!(decoded, Value::from(7_u64));
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn decode_plain_json_bool() {
-        let stream = destream_json::encode(true).expect("encode plain json bool");
-        let decoded: Value = decode_json_value(stream.map_err(|err| err.to_string())).await;
-        assert_eq!(decoded, Value::Number(Number::Bool(true.into())));
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn encode_bool_value_as_plain_json_bool() {
-        let value = Value::Number(Number::Bool(true.into()));
-        let bytes = encode_json_bytes(value).await;
-        assert_eq!(bytes, b"true");
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn roundtrip_string_value() {
-        let value = Value::from("hello");
-        let encoded = destream_json::encode(value.clone()).expect("encode string value");
-        let decoded: Value = decode_json_value(encoded.map_err(|err| err.to_string())).await;
-        assert_eq!(decoded, value);
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn encode_string_value_as_plain_json_string() {
-        let value = Value::from("hello");
-        let bytes = encode_json_bytes(value).await;
-        assert_eq!(bytes, br#""hello""#);
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn roundtrip_link_value() {
-        let link = Link::from_str(
-            &PathBuf::from(path_label(&["state", "scalar", "ref", "cond"])).to_string(),
-        )
-        .expect("link");
-        let value = Value::from(link);
-        let encoded = destream_json::encode(value.clone()).expect("encode link value");
-        let decoded: Value = decode_json_value(encoded.map_err(|err| err.to_string())).await;
-        assert_eq!(decoded, value);
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn roundtrip_tuple_value() {
-        let value = Value::Tuple(vec![
-            Value::Number(Number::Bool(true.into())),
-            Value::from(7_u64),
-            Value::from("x"),
-        ]);
-        let encoded = destream_json::encode(value.clone()).expect("encode tuple value");
-        let decoded: Value = decode_json_value(encoded.map_err(|err| err.to_string())).await;
-        assert_eq!(decoded, value);
+        // Preserve the original aggregate parity fixture, including its large child.
+        let values = vec![
+            Value::default(),
+            Value::from(Arc::from([0_u8, 1, 255])),
+            Value::from("/example".parse::<Link>().unwrap()),
+            cases[2].1.clone(),
+            cases[0].1.clone(),
+            Value::from("quoted \"value\""),
+            Value::from(Vec::<Value>::new()),
+            Value::from(vec![Value::from("x".repeat(200_000))]),
+        ];
+        for value in values
+            .iter()
+            .chain(std::iter::once(&Value::from(values.clone())))
+        {
+            assert_eq!(
+                encode_json_bytes(value).await,
+                encode_json_bytes(value.clone()).await
+            );
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -872,3 +526,33 @@ mod tests {
         assert!(decoded.is_err());
     }
 }
+
+#[cfg(test)]
+mod allocation_tests {
+    use super::*;
+    use get_size::GetSize;
+
+    #[test]
+    fn retained_size_includes_inline_values_and_spare_nested_capacity() {
+        let mut string = String::with_capacity(64);
+        string.push_str("abc");
+        let string_capacity = string.capacity();
+        let mut values = Vec::with_capacity(8);
+        values.push(Value::default());
+        values.push(Value::from(string));
+        let capacity = values.capacity();
+        assert_eq!(Value::default().get_size(), std::mem::size_of::<Value>());
+        assert_eq!(
+            Value::from(values).get_size(),
+            std::mem::size_of::<Value>()
+                + capacity * std::mem::size_of::<Value>()
+                + string_capacity
+        );
+        let link: Link = "https://example.com/one/two/three".parse().unwrap();
+        assert!(link.get_heap_size() > 0);
+        assert!(Value::from(link).get_size() > std::mem::size_of::<Value>());
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_tests;
