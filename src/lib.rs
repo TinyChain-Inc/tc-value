@@ -1,20 +1,25 @@
 #![forbid(unsafe_code)]
 
-//! Canonical TinyChain values with iterative ownership and streaming.
+//! Canonical TinyChain values with bounded decoding and streaming.
 
 use std::cmp::Ordering;
 use std::str::FromStr;
 use std::sync::Arc;
 
-use number_general::Number;
+use async_hash::{Digest, Hash, Output};
+use collate::{Collate, Collator};
+use get_size::GetSize;
+use number_general::{Number, NumberCollator};
 use pathlink::{label, path_label, Label, Link, PathBuf, PathLabel, PathSegment};
 
 use crate::class::{Class, NativeClass};
-mod allocation;
+
 pub mod class;
+mod stream;
 
 pub use class::{number_type_from_path, number_type_path};
 pub use number_general::NumberType;
+pub use stream::{decode_typed_value, decode_value};
 
 const VALUE_PREFIX: PathLabel = path_label(&["state", "scalar", "value"]);
 const SEGMENT_BYTES: &str = "bytes";
@@ -30,17 +35,125 @@ const LABEL_NUMBER: Label = label(SEGMENT_NUMBER);
 const LABEL_STRING: Label = label(SEGMENT_STRING);
 const LABEL_TUPLE: Label = label(SEGMENT_TUPLE);
 
-mod owned;
-mod stream;
+/// Maximum tuple nesting accepted by codecs and conversions into Value.
+/// Native constructors must respect this limit too; ordinary enum operations
+/// and destruction recurse through tuple children.
+pub const MAX_VALUE_DEPTH: usize = 64;
 
-pub use owned::{Value, ValueCollator, ValueKind};
-pub use stream::decode_typed_value;
+/// A native scalar value. Codecs and checked conversions bound tuple nesting.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub enum Value {
+    #[default]
+    None,
+    Bytes(Arc<[u8]>),
+    Link(Link),
+    Number(Number),
+    String(String),
+    Tuple(Vec<Value>),
+}
+
+impl Eq for Value {}
+
+impl Value {
+    pub fn class(&self) -> ValueType {
+        match self {
+            Self::None => ValueType::None,
+            Self::Bytes(_) => ValueType::Bytes,
+            Self::Link(_) => ValueType::Link,
+            Self::Number(_) => ValueType::Number,
+            Self::String(_) => ValueType::String,
+            Self::Tuple(_) => ValueType::Tuple,
+        }
+    }
+
+    /// Whether this value fits within the remaining tuple nesting allowance.
+    /// Conversion boundaries subtract any enclosing Scalar tuples first.
+    pub fn within_depth(&self, remaining: usize) -> bool {
+        match self {
+            Self::Tuple(items) => {
+                remaining > 0 && items.iter().all(|item| item.within_depth(remaining - 1))
+            }
+            _ => true,
+        }
+    }
+}
+
+impl<D: Digest> Hash<D> for Value {
+    fn hash(self) -> Output<D> {
+        Hash::<D>::hash(&self)
+    }
+}
+
+impl<D: Digest> Hash<D> for &Value {
+    fn hash(self) -> Output<D> {
+        match self {
+            Value::None => async_hash::default_hash::<D>(),
+            Value::Bytes(bytes) => D::digest(bytes),
+            Value::Link(link) => Hash::<D>::hash(link),
+            Value::Number(number) => Hash::<D>::hash(*number),
+            Value::String(string) => Hash::<D>::hash(string),
+            Value::Tuple(items) if items.is_empty() => async_hash::default_hash::<D>(),
+            Value::Tuple(items) => {
+                let mut digest = D::new();
+                for item in items {
+                    digest.update(Hash::<D>::hash(item));
+                }
+                digest.finalize()
+            }
+        }
+    }
+}
+
+impl GetSize for Value {
+    fn get_heap_size(&self) -> usize {
+        match self {
+            Self::Tuple(items) => {
+                items.capacity() * std::mem::size_of::<Value>()
+                    + items.iter().map(GetSize::get_heap_size).sum::<usize>()
+            }
+            Self::Bytes(bytes) => bytes.len() + 2 * std::mem::size_of::<usize>(),
+            Self::Link(link) => link.get_heap_size(),
+            Self::String(string) => string.capacity(),
+            _ => 0,
+        }
+    }
+}
+
+/// Defines the canonical collation order for [`Value`].
+#[derive(Copy, Clone, Default, Eq, PartialEq)]
+pub struct ValueCollator {
+    bytes: Collator<Arc<[u8]>>,
+    link: Collator<Link>,
+    number: NumberCollator,
+    string: Collator<String>,
+}
+
+impl Collate for ValueCollator {
+    type Value = Value;
+
+    fn cmp(&self, left: &Value, right: &Value) -> Ordering {
+        match (left, right) {
+            (Value::None, Value::None) => Ordering::Equal,
+            (Value::Bytes(left), Value::Bytes(right)) => self.bytes.cmp(left, right),
+            (Value::Link(left), Value::Link(right)) => self.link.cmp(left, right),
+            (Value::Number(left), Value::Number(right)) => self.number.cmp(left, right),
+            (Value::String(left), Value::String(right)) => self.string.cmp(left, right),
+            (Value::Tuple(left), Value::Tuple(right)) => left
+                .iter()
+                .zip(right)
+                .map(|(left, right)| self.cmp(left, right))
+                .find(|order| *order != Ordering::Equal)
+                .unwrap_or_else(|| left.len().cmp(&right.len())),
+            _ => left.class().cmp(&right.class()),
+        }
+    }
+}
 
 macro_rules! value_from {
     ($($ty:ty => $kind:ident),* $(,)?) => {$ (
         impl From<$ty> for Value {
             fn from(value: $ty) -> Self {
-                ValueKind::$kind(value).into()
+                Value::$kind(value)
             }
         }
     )*};
@@ -59,26 +172,31 @@ impl From<bool> for Value {
         Number::from(value).into()
     }
 }
+
 impl From<u64> for Value {
     fn from(value: u64) -> Self {
         Number::from(value).into()
     }
 }
+
 impl From<Vec<u8>> for Value {
     fn from(value: Vec<u8>) -> Self {
-        ValueKind::Bytes(value.into()).into()
+        Value::Bytes(value.into())
     }
 }
+
 impl From<bytes::Bytes> for Value {
     fn from(value: bytes::Bytes) -> Self {
         value.to_vec().into()
     }
 }
+
 impl From<&str> for Value {
     fn from(value: &str) -> Self {
         value.to_owned().into()
     }
 }
+
 impl From<()> for Value {
     fn from(_: ()) -> Self {
         Self::default()
@@ -174,28 +292,28 @@ where
     T: TryCastFrom<Value>,
 {
     fn can_cast_from(value: &Value) -> bool {
-        match value.kind() {
-            ValueKind::Tuple(tuple) => tuple.iter().all(T::can_cast_from),
+        match value {
+            Value::Tuple(tuple) => tuple.iter().all(T::can_cast_from),
             _ => T::can_cast_from(value),
         }
     }
 
     fn opt_cast_from(value: Value) -> Option<Self> {
-        match value.into_kind() {
-            ValueKind::Tuple(tuple) => tuple.into_iter().map(T::opt_cast_from).collect(),
-            kind => Some(vec![T::opt_cast_from(kind.into())?]),
+        match value {
+            Value::Tuple(tuple) => tuple.into_iter().map(T::opt_cast_from).collect(),
+            value => Some(vec![T::opt_cast_from(value)?]),
         }
     }
 }
 
 impl TryCastFrom<Value> for String {
     fn can_cast_from(value: &Value) -> bool {
-        matches!(value.kind(), ValueKind::String(_))
+        matches!(value, Value::String(_))
     }
 
     fn opt_cast_from(value: Value) -> Option<Self> {
-        match value.into_kind() {
-            ValueKind::String(s) => Some(s),
+        match value {
+            Value::String(s) => Some(s),
             _ => None,
         }
     }
@@ -203,12 +321,12 @@ impl TryCastFrom<Value> for String {
 
 impl TryCastFrom<Value> for Arc<[u8]> {
     fn can_cast_from(value: &Value) -> bool {
-        matches!(value.kind(), ValueKind::Bytes(_))
+        matches!(value, Value::Bytes(_))
     }
 
     fn opt_cast_from(value: Value) -> Option<Self> {
-        match value.into_kind() {
-            ValueKind::Bytes(bytes) => Some(bytes),
+        match value {
+            Value::Bytes(bytes) => Some(bytes),
             _ => None,
         }
     }
@@ -216,12 +334,12 @@ impl TryCastFrom<Value> for Arc<[u8]> {
 
 impl TryCastFrom<Value> for bytes::Bytes {
     fn can_cast_from(value: &Value) -> bool {
-        matches!(value.kind(), ValueKind::Bytes(_))
+        matches!(value, Value::Bytes(_))
     }
 
     fn opt_cast_from(value: Value) -> Option<Self> {
-        match value.into_kind() {
-            ValueKind::Bytes(bytes) => Some(Self::from_owner(bytes)),
+        match value {
+            Value::Bytes(bytes) => Some(Self::from_owner(bytes)),
             _ => None,
         }
     }
@@ -229,15 +347,15 @@ impl TryCastFrom<Value> for bytes::Bytes {
 
 impl TryCastFrom<Value> for Id {
     fn can_cast_from(value: &Value) -> bool {
-        match value.kind() {
-            ValueKind::String(s) => <Id as TryCastFrom<String>>::can_cast_from(s),
+        match value {
+            Value::String(s) => <Id as TryCastFrom<String>>::can_cast_from(s),
             _ => false,
         }
     }
 
     fn opt_cast_from(value: Value) -> Option<Self> {
-        match value.into_kind() {
-            ValueKind::String(s) => Id::opt_cast_from(s),
+        match value {
+            Value::String(s) => Id::opt_cast_from(s),
             _ => None,
         }
     }
@@ -249,14 +367,14 @@ where
     T2: TryCastFrom<Value>,
 {
     fn can_cast_from(value: &Value) -> bool {
-        let ValueKind::Tuple(pair) = value.kind() else {
+        let Value::Tuple(pair) = value else {
             return false;
         };
         pair.len() == 2 && T1::can_cast_from(&pair[0]) && T2::can_cast_from(&pair[1])
     }
 
     fn opt_cast_from(value: Value) -> Option<Self> {
-        let ValueKind::Tuple(pair) = value.into_kind() else {
+        let Value::Tuple(pair) = value else {
             return None;
         };
         if pair.len() != 2 {
@@ -272,16 +390,16 @@ where
 
 impl TryCastFrom<Value> for bool {
     fn can_cast_from(value: &Value) -> bool {
-        matches!(value.kind(), ValueKind::Number(_) | ValueKind::None)
+        matches!(value, Value::Number(_) | Value::None)
     }
 
     fn opt_cast_from(value: Value) -> Option<Self> {
-        match value.into_kind() {
-            ValueKind::Number(n) => {
+        match value {
+            Value::Number(n) => {
                 use safecast::CastFrom;
                 Some(u64::cast_from(n) != 0)
             }
-            ValueKind::None => Some(false),
+            Value::None => Some(false),
             _ => None,
         }
     }
@@ -293,13 +411,13 @@ impl TryCastFrom<Value> for std::ops::Bound<Value> {
     }
 
     fn opt_cast_from(value: Value) -> Option<Self> {
-        match value.into_kind() {
-            ValueKind::None => Some(std::ops::Bound::Unbounded),
-            ValueKind::Tuple(mut pair) if pair.len() == 2 => {
+        match value {
+            Value::None => Some(std::ops::Bound::Unbounded),
+            Value::Tuple(mut pair) if pair.len() == 2 => {
                 let value = pair.pop()?;
-                match pair.pop()?.into_kind() {
-                    ValueKind::String(tag) if tag == "in" => Some(std::ops::Bound::Included(value)),
-                    ValueKind::String(tag) if tag == "ex" => Some(std::ops::Bound::Excluded(value)),
+                match pair.pop()? {
+                    Value::String(tag) if tag == "in" => Some(std::ops::Bound::Included(value)),
+                    Value::String(tag) if tag == "ex" => Some(std::ops::Bound::Excluded(value)),
                     _ => None,
                 }
             }
@@ -320,8 +438,8 @@ impl TryCastFrom<Value> for ValueType {
 
 impl ValueType {
     fn opt_cast_from_ref(value: &Value) -> Option<Self> {
-        match value.kind() {
-            ValueKind::String(s) => {
+        match value {
+            Value::String(s) => {
                 let path = pathlink::PathBuf::from_str(s).ok()?;
                 NativeClass::from_path(&path)
             }
@@ -407,7 +525,7 @@ mod tests {
     #[test]
     fn value_from_u64() {
         let value = Value::from(123_u64);
-        assert!(matches!(value.kind(), ValueKind::Number(Number::UInt(_))));
+        assert!(matches!(value, Value::Number(Number::UInt(_))));
     }
 
     #[test]

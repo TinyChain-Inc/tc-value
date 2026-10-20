@@ -15,7 +15,7 @@ use get_size::GetSize;
 use number_general::Number;
 
 use crate::class::NativeClass;
-use crate::{Value, ValueCollator, ValueKind, ValueType};
+use crate::{Value, ValueCollator, ValueType};
 
 fn nested(depth: usize, mut leaf: Value) -> Value {
     for _ in 0..depth {
@@ -25,14 +25,14 @@ fn nested(depth: usize, mut leaf: Value) -> Value {
 }
 
 fn reference_hash(value: &Value) -> async_hash::Output<Sha256> {
-    match value.kind() {
-        ValueKind::None => async_hash::default_hash::<Sha256>(),
-        ValueKind::Bytes(bytes) => Sha256::digest(bytes),
-        ValueKind::Link(link) => Hash::<Sha256>::hash(link),
-        ValueKind::Number(number) => Hash::<Sha256>::hash(*number),
-        ValueKind::String(string) => Hash::<Sha256>::hash(string),
-        ValueKind::Tuple(values) if values.is_empty() => async_hash::default_hash::<Sha256>(),
-        ValueKind::Tuple(values) => {
+    match &value {
+        Value::None => async_hash::default_hash::<Sha256>(),
+        Value::Bytes(bytes) => Sha256::digest(bytes),
+        Value::Link(link) => Hash::<Sha256>::hash(link),
+        Value::Number(number) => Hash::<Sha256>::hash(*number),
+        Value::String(string) => Hash::<Sha256>::hash(string),
+        Value::Tuple(values) if values.is_empty() => async_hash::default_hash::<Sha256>(),
+        Value::Tuple(values) => {
             let mut digest = Sha256::new();
             for value in values {
                 digest.update(reference_hash(value));
@@ -85,9 +85,6 @@ fn lifecycle_preserves_leaf_and_tuple_semantics() {
     }
     let nan = Number::from(f64::NAN);
     assert_eq!(Value::from(nan) == Value::from(nan), nan == nan);
-    let mut value = Value::default();
-    *value.kind_mut() = root.into_kind();
-    assert!(matches!(value.kind(), ValueKind::Tuple(_)));
 }
 
 struct Discard;
@@ -98,8 +95,8 @@ impl Write for Discard {
 }
 
 #[test]
-fn deep_lifecycle_and_movable_contents_use_bounded_stack() {
-    let value = nested(16_384, "leaf".into());
+fn bounded_lifecycle_uses_normal_stack() {
+    let value = nested(crate::MAX_VALUE_DEPTH, "leaf".into());
     let clone = value.clone();
     assert_eq!(value, clone);
     assert_eq!(
@@ -109,11 +106,16 @@ fn deep_lifecycle_and_movable_contents_use_bounded_stack() {
     assert_eq!(Hash::<Sha256>::hash(&value), Hash::<Sha256>::hash(&clone));
     assert_eq!(
         value.get_heap_size(),
-        16_384 * std::mem::size_of::<Value>() + 4
+        crate::MAX_VALUE_DEPTH * std::mem::size_of::<Value>() + 4
     );
     write!(Discard, "{value:?}").unwrap();
-    write!(Discard, "{:#?}", nested(1024, Value::default())).unwrap();
-    drop(value.into_kind());
+    write!(
+        Discard,
+        "{:#?}",
+        nested(crate::MAX_VALUE_DEPTH, Value::default())
+    )
+    .unwrap();
+    drop(value);
     drop(clone);
 }
 
@@ -122,6 +124,7 @@ enum Codec {
     Json,
     Tbon,
 }
+
 impl Codec {
     async fn encode<'a>(self, value: impl IntoStream<'a> + 'a) -> Vec<u8> {
         match self {
@@ -186,22 +189,22 @@ async fn canonical_depth_boundary_and_typed_tuples_across_codecs() {
     tokio::spawn(async {
         for codec in [Codec::Json, Codec::Tbon] {
             for chunk in [1, 4096] {
-                for depth in [1024, 1025] {
+                for depth in [64, 65] {
                     let value = nested(depth, Value::default());
                     let encoded = codec.encode(&value).await;
                     assert_eq!(encoded, codec.encode(value.clone()).await);
                     let decoded = codec.decode(encoded, chunk).await;
-                    if depth == 1024 {
+                    if depth == 64 {
                         assert_eq!(decoded.unwrap(), value, "{codec:?}");
                     } else {
-                        assert!(decoded.is_err(), "{codec:?}: depth 1025 accepted");
+                        assert!(decoded.is_err(), "{codec:?}: depth 65 accepted");
                     }
-                    let typed = codec.encode(TypedTuples(512, depth == 1025)).await;
+                    let typed = codec.encode(TypedTuples(64, depth == 65)).await;
                     let decoded = codec.decode(typed, chunk).await;
-                    if depth == 1024 {
-                        assert_eq!(decoded.unwrap(), nested(512, Value::default()));
+                    if depth == 64 {
+                        assert_eq!(decoded.unwrap(), nested(64, Value::default()));
                     } else {
-                        assert!(decoded.is_err(), "{codec:?}: typed depth 1025 accepted");
+                        assert!(decoded.is_err(), "{codec:?}: typed depth 65 accepted");
                     }
                 }
             }
@@ -222,7 +225,7 @@ impl Drop for Dropped {
 async fn interrupted_construction_and_owned_encoding_release_deep_values() {
     tokio::spawn(async {
         let complete = Codec::Json
-            .encode(nested(1000, Value::from("completed")))
+            .encode(nested(63, Value::from("completed")))
             .await;
         let mut prefix = vec![b'['];
         prefix.extend(complete);
@@ -244,8 +247,10 @@ async fn interrupted_construction_and_owned_encoding_release_deep_values() {
             .is_none());
         assert!(dropped.load(AtomicOrdering::SeqCst));
         for polled in [false, true] {
-            let mut json = destream_json::encode(nested(16_384, Value::default())).unwrap();
-            let mut tbon = tbon::en::encode(nested(16_384, Value::default())).unwrap();
+            let mut json =
+                destream_json::encode(nested(crate::MAX_VALUE_DEPTH, Value::default())).unwrap();
+            let mut tbon =
+                tbon::en::encode(nested(crate::MAX_VALUE_DEPTH, Value::default())).unwrap();
             if polled {
                 assert!(json.next().await.is_some());
                 assert!(tbon.next().await.is_some());

@@ -9,7 +9,7 @@ of host state, transactions, collections, and transport adapters.
 
 ## Values
 
-`Value` owns a movable `ValueKind` with six variants:
+`Value` is a plain enum with six variants:
 
 - `None`
 - `Bytes(Arc<[u8]>)`
@@ -19,11 +19,15 @@ of host state, transactions, collections, and transport adapters.
 - `Tuple`
 
 Maps belong to the IR/state collection structure rather than `Value`. Booleans
-use `Number::Bool`. Inspect a value with `kind()` or `kind_mut()`, consume it with
-`into_kind()`, and construct it with `Value::from(kind)` or its typed conversions.
-The owner keeps destruction, cloning, equality, collation, hashing, formatting,
-and retained size accounting iterative. Tuples retain ordinary `Vec<Value>`
-children; no alternate tree representation is needed.
+use `Number::Bool`. Match variants directly and construct them directly or through
+typed conversions. Tuples own ordinary `Vec<Value>` children.
+
+Codecs and Scalar/State-to-Value conversions accept at most 64 nested Value tuples.
+Conversions include embedded Values when checking the resulting depth, before
+constructing a tuple tree. Trusted native constructors must respect this contract:
+cloning, comparison, hashing, formatting, size accounting, and destruction use
+ordinary recursive enum operations. Scalar and State retain their own independent
+ownership and execution mechanisms.
 
 Each variant has its canonical type URI, size accounting, collation,
 conversions, semantic traversal, and symmetric `destream` codec. Bytes are an
@@ -39,17 +43,12 @@ does not maintain compatibility envelopes.
 cargo test --all-targets --all-features
 ```
 
-`Value::allocation_bound` reports the retained heap contribution of a codec
-inspection event. Persistence adapters sum these checked bounds before decoding;
-framing and borrowed token traversal remain owned by the codec. The bound covers
-canonical decoder capacities and link allocations without interpreting wire tags
-or constructing a Value.
+`GetSize` measures actual retained storage, including container capacity and link
+allocations. Persistence adapters decode values before cache admission; this crate
+retains structural decoding limits rather than predicting allocation.
 
-Canonical decoding retains one construction frame per open tuple and uses the
-codec's shallow container cursor. Encoding consumes the same value traversal as
-shallow events. Both paths preserve wire representations and source ownership;
-errors and cancellation drop unfinished values through their owning boundaries.
-
-Decoding and encoding reserve growing construction and traversal containers
-fallibly. Infallible Rust traits, including `Clone` and `Drop`, retain ordinary
-allocation behavior while traversing on a bounded call stack.
+Canonical decoding retains one construction frame per open tuple and rejects a
+65th tuple before constructing it. Streaming encoding uses codec-local traversal
+and preserves wire representations. Errors and cancellation release unfinished
+values through ordinary Rust ownership. Construction and encoding cursor vectors
+reserve fallibly; infallible Rust traits retain ordinary allocation behavior.
