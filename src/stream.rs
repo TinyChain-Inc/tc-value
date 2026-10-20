@@ -4,7 +4,7 @@ use std::sync::Arc;
 use destream::de::FromStream;
 use destream::en::EncodeMap;
 use destream::{de, en, IntoStream};
-use number_general::Number;
+use number_general::{Number, NumberInstance};
 use pathlink::{Link, PathBuf};
 
 use crate::class::NativeClass;
@@ -61,10 +61,20 @@ async fn decode_leaf<D: de::Decoder>(
             decoder.finish_child(map).await?;
             bytes.into()
         }
-        ValueType::Number => {
-            let number = Number::from_stream((), decoder).await?;
+        ValueType::Number(dtype) => {
+            let number = if dtype == crate::NumberType::Complex(number_general::ComplexType::C32)
+                && decoder.peek_kind().await? == de::Kind::Seq
+            {
+                // TBON preserves f32 components; its f64 decoder cannot read them.
+                let components = <[f32; 2]>::from_stream((), decoder).await?;
+                Number::from(number_general::Complex::from(components))
+            } else {
+                Number::from_stream((), decoder).await?
+            };
             decoder.finish_child(map).await?;
-            number.into()
+            // An explicit wire tag requests conversion, as in v1.
+            // Schema membership checks remain noncoercing.
+            number.into_type(dtype).into()
         }
         ValueType::None => {
             de::IgnoredAny::from_stream((), decoder).await?;
@@ -192,6 +202,7 @@ pub async fn decode_value<D: de::Decoder>(
 }
 
 struct LeafVisitor;
+
 impl de::Visitor for LeafVisitor {
     type Value = Value;
     fn expecting() -> &'static str {
@@ -227,10 +238,9 @@ impl de::Visitor for LeafVisitor {
     }
 }
 
-struct LeafRef<'a>(&'a Value);
-impl<'en> IntoStream<'en> for LeafRef<'en> {
-    fn into_stream<E: en::Encoder<'en>>(self, encoder: E) -> Result<E::Ok, E::Error> {
-        match self.0 {
+impl<'en> en::ToStream<'en> for Value {
+    fn to_stream<E: en::Encoder<'en>>(&'en self, encoder: E) -> Result<E::Ok, E::Error> {
+        match self {
             Value::None => encoder.encode_unit(),
             Value::Bytes(bytes) => {
                 let mut map = encoder.encode_map(Some(1))?;
@@ -245,17 +255,47 @@ impl<'en> IntoStream<'en> for LeafRef<'en> {
                 map.encode_entry(link.to_string(), Vec::<()>::new())?;
                 map.end()
             }
+            Value::Number(number @ Number::Complex(_)) => {
+                let mut map = encoder.encode_map(Some(1))?;
+                map.encode_entry(ValueType::Number(number.class()).path().to_string(), number)?;
+                map.end()
+            }
             Value::Number(number) => number.into_stream(encoder),
             Value::String(string) => string.into_stream(encoder),
-            Value::Tuple(_) => unreachable!("tuple encoding uses events"),
+            tuple @ Value::Tuple(_) => {
+                let mut next = Some(tuple);
+                let mut frames: Vec<std::slice::Iter<'_, Value>> = Vec::new();
+                let events = std::iter::from_fn(move || {
+                    let value = match next.take() {
+                        Some(value) => value,
+                        None => match frames.last_mut()?.next() {
+                            Some(value) => value,
+                            None => {
+                                frames.pop();
+                                return Some(Ok(en::Event::End));
+                            }
+                        },
+                    };
+                    Some(Ok(match value {
+                        Value::Tuple(children) => {
+                            if let Err(error) = frames.try_reserve(1) {
+                                return Some(Err(en::Error::custom(error)));
+                            }
+                            frames.push(children.iter());
+                            en::Event::SeqStart(Some(children.len()))
+                        }
+                        leaf => en::Event::Value(leaf),
+                    }))
+                });
+                encoder.encode_events(futures::stream::iter(events))
+            }
         }
     }
 }
 
-struct Leaf(Value);
-impl<'en> IntoStream<'en> for Leaf {
+impl<'en> IntoStream<'en> for Value {
     fn into_stream<E: en::Encoder<'en>>(self, encoder: E) -> Result<E::Ok, E::Error> {
-        match self.0 {
+        match self {
             Value::None => encoder.encode_unit(),
             Value::Bytes(bytes) => {
                 let mut map = encoder.encode_map(Some(1))?;
@@ -270,70 +310,41 @@ impl<'en> IntoStream<'en> for Leaf {
                 map.encode_entry(link.to_string(), Vec::<()>::new())?;
                 map.end()
             }
+            Value::Number(number @ Number::Complex(_)) => {
+                let mut map = encoder.encode_map(Some(1))?;
+                map.encode_entry(ValueType::Number(number.class()).path().to_string(), number)?;
+                map.end()
+            }
             Value::Number(number) => number.into_stream(encoder),
             Value::String(string) => string.into_stream(encoder),
-            Value::Tuple(_) => unreachable!("tuple encoding uses events"),
+            tuple @ Value::Tuple(_) => {
+                let mut next = Some(tuple);
+                let mut frames: Vec<std::vec::IntoIter<Value>> = Vec::new();
+                let events = std::iter::from_fn(move || {
+                    let value = match next.take() {
+                        Some(value) => value,
+                        None => match frames.last_mut()?.next() {
+                            Some(value) => value,
+                            None => {
+                                frames.pop();
+                                return Some(Ok(en::Event::End));
+                            }
+                        },
+                    };
+                    Some(Ok(match value {
+                        Value::Tuple(children) => {
+                            let len = children.len();
+                            if let Err(error) = frames.try_reserve(1) {
+                                return Some(Err(en::Error::custom(error)));
+                            }
+                            frames.push(children.into_iter());
+                            en::Event::SeqStart(Some(len))
+                        }
+                        leaf => en::Event::Value(leaf),
+                    }))
+                });
+                encoder.encode_events(futures::stream::iter(events))
+            }
         }
-    }
-}
-
-impl<'en> en::ToStream<'en> for Value {
-    fn to_stream<E: en::Encoder<'en>>(&'en self, encoder: E) -> Result<E::Ok, E::Error> {
-        let mut next = Some(self);
-        let mut frames: Vec<std::slice::Iter<'_, Value>> = Vec::new();
-        let events = std::iter::from_fn(move || {
-            let value = match next.take() {
-                Some(value) => value,
-                None => match frames.last_mut()?.next() {
-                    Some(value) => value,
-                    None => {
-                        frames.pop();
-                        return Some(Ok(en::Event::End));
-                    }
-                },
-            };
-            Some(Ok(match value {
-                Value::Tuple(children) => {
-                    if let Err(error) = frames.try_reserve(1) {
-                        return Some(Err(en::Error::custom(error)));
-                    }
-                    frames.push(children.iter());
-                    en::Event::SeqStart(Some(children.len()))
-                }
-                leaf => en::Event::Value(LeafRef(leaf)),
-            }))
-        });
-        encoder.encode_events(futures::stream::iter(events))
-    }
-}
-
-impl<'en> IntoStream<'en> for Value {
-    fn into_stream<E: en::Encoder<'en>>(self, encoder: E) -> Result<E::Ok, E::Error> {
-        let mut next = Some(self);
-        let mut frames: Vec<std::vec::IntoIter<Value>> = Vec::new();
-        let events = std::iter::from_fn(move || {
-            let value = match next.take() {
-                Some(value) => value,
-                None => match frames.last_mut()?.next() {
-                    Some(value) => value,
-                    None => {
-                        frames.pop();
-                        return Some(Ok(en::Event::End));
-                    }
-                },
-            };
-            Some(Ok(match value {
-                Value::Tuple(children) => {
-                    let len = children.len();
-                    if let Err(error) = frames.try_reserve(1) {
-                        return Some(Err(en::Error::custom(error)));
-                    }
-                    frames.push(children.into_iter());
-                    en::Event::SeqStart(Some(len))
-                }
-                leaf => en::Event::Value(Leaf(leaf)),
-            }))
-        });
-        encoder.encode_events(futures::stream::iter(events))
     }
 }

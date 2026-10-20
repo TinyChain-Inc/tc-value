@@ -9,7 +9,9 @@ use std::sync::Arc;
 use async_hash::{Digest, Hash, Output};
 use collate::{Collate, Collator};
 use get_size::GetSize;
-use number_general::{Number, NumberCollator};
+use number_general::{
+    ComplexType, FloatType, IntType, Number, NumberCollator, NumberInstance, UIntType,
+};
 use pathlink::{label, path_label, Label, Link, PathBuf, PathLabel, PathSegment};
 
 use crate::class::{Class, NativeClass};
@@ -25,13 +27,11 @@ const VALUE_PREFIX: PathLabel = path_label(&["state", "scalar", "value"]);
 const SEGMENT_BYTES: &str = "bytes";
 const SEGMENT_LINK: &str = "link";
 const SEGMENT_NONE: &str = "none";
-const SEGMENT_NUMBER: &str = "number";
 const SEGMENT_STRING: &str = "string";
 const SEGMENT_TUPLE: &str = "tuple";
 const LABEL_BYTES: Label = label(SEGMENT_BYTES);
 const LABEL_LINK: Label = label(SEGMENT_LINK);
 const LABEL_NONE: Label = label(SEGMENT_NONE);
-const LABEL_NUMBER: Label = label(SEGMENT_NUMBER);
 const LABEL_STRING: Label = label(SEGMENT_STRING);
 const LABEL_TUPLE: Label = label(SEGMENT_TUPLE);
 
@@ -60,7 +60,7 @@ impl Value {
             Self::None => ValueType::None,
             Self::Bytes(_) => ValueType::Bytes,
             Self::Link(_) => ValueType::Link,
-            Self::Number(_) => ValueType::Number,
+            Self::Number(number) => ValueType::Number(number.class()),
             Self::String(_) => ValueType::String,
             Self::Tuple(_) => ValueType::Tuple,
         }
@@ -209,7 +209,7 @@ pub enum ValueType {
     Bytes,
     Link,
     None,
-    Number,
+    Number(NumberType),
     String,
     Tuple,
 }
@@ -220,14 +220,17 @@ impl Ord for ValueType {
             match value_type {
                 ValueType::None => 0,
                 ValueType::Bytes => 1,
-                ValueType::Number => 2,
+                ValueType::Number(_) => 2,
                 ValueType::String => 3,
                 ValueType::Link => 4,
                 ValueType::Tuple => 5,
             }
         }
 
-        rank(self).cmp(&rank(other))
+        match (self, other) {
+            (Self::Number(left), Self::Number(right)) => left.cmp(right),
+            _ => rank(self).cmp(&rank(other)),
+        }
     }
 }
 
@@ -238,6 +241,27 @@ impl PartialOrd for ValueType {
 }
 
 impl ValueType {
+    /// Whether this declaration accepts an actual type without converting its value.
+    /// Generic numerical declarations accept their family; concrete types match exactly.
+    pub fn accepts(&self, actual: &Self) -> bool {
+        match (self, actual) {
+            (Self::Number(NumberType::Number), Self::Number(_)) => true,
+            (
+                Self::Number(NumberType::Complex(ComplexType::Complex)),
+                Self::Number(NumberType::Complex(_)),
+            )
+            | (
+                Self::Number(NumberType::Float(FloatType::Float)),
+                Self::Number(NumberType::Float(_)),
+            )
+            | (Self::Number(NumberType::Int(IntType::Int)), Self::Number(NumberType::Int(_)))
+            | (Self::Number(NumberType::UInt(UIntType::UInt)), Self::Number(NumberType::UInt(_))) => {
+                true
+            }
+            _ => self == actual,
+        }
+    }
+
     fn from_suffix(path: &[PathSegment]) -> Option<&PathSegment> {
         let prefix_len = VALUE_PREFIX[..].len();
         if path.len() != prefix_len + 1 {
@@ -256,13 +280,16 @@ impl Class for ValueType {}
 
 impl NativeClass for ValueType {
     fn from_path(path: &[PathSegment]) -> Option<Self> {
+        if let Some(dtype) = number_type_from_path(path) {
+            return Some(Self::Number(dtype));
+        }
+
         let segment = Self::from_suffix(path)?;
 
         match segment.as_str() {
             SEGMENT_BYTES => Some(ValueType::Bytes),
             SEGMENT_LINK => Some(ValueType::Link),
             SEGMENT_NONE => Some(ValueType::None),
-            SEGMENT_NUMBER => Some(ValueType::Number),
             SEGMENT_STRING => Some(ValueType::String),
             SEGMENT_TUPLE => Some(ValueType::Tuple),
             _ => None,
@@ -275,7 +302,7 @@ impl NativeClass for ValueType {
             ValueType::Bytes => prefix.append(LABEL_BYTES),
             ValueType::Link => prefix.append(LABEL_LINK),
             ValueType::None => prefix.append(LABEL_NONE),
-            ValueType::Number => prefix.append(LABEL_NUMBER),
+            ValueType::Number(dtype) => number_type_path(dtype),
             ValueType::String => prefix.append(LABEL_STRING),
             ValueType::Tuple => prefix.append(LABEL_TUPLE),
         }
@@ -455,222 +482,13 @@ impl safecast::CastFrom<ValueType> for Value {
 }
 
 #[cfg(test)]
-mod tests {
-    use std::ops::Bound;
-
-    use collate::Collate;
-    use destream::{de, en};
-    use futures::TryStreamExt;
-
-    use super::*;
-
-    #[test]
-    fn cast_tagged_bounds() {
-        assert_eq!(
-            Bound::<Value>::opt_cast_from(Value::default()),
-            Some(Bound::Unbounded)
-        );
-        assert_eq!(
-            Bound::<Value>::opt_cast_from(Value::from(
-                vec![Value::from("in"), Value::from(1_u64),]
-            )),
-            Some(Bound::Included(Value::from(1_u64)))
-        );
-        assert_eq!(
-            Bound::<Value>::opt_cast_from(Value::from(
-                vec![Value::from("ex"), Value::from(2_u64),]
-            )),
-            Some(Bound::Excluded(Value::from(2_u64)))
-        );
-    }
-
-    #[test]
-    fn reject_untagged_bounds() {
-        assert_eq!(Bound::<Value>::opt_cast_from(Value::from(1_u64)), None);
-        assert_eq!(
-            Bound::<Value>::opt_cast_from(Value::from(vec![
-                Value::from("unknown"),
-                Value::from(1_u64),
-            ])),
-            None
-        );
-    }
-
-    async fn encode_json_bytes<'en, T>(value: T) -> Vec<u8>
-    where
-        T: en::IntoStream<'en> + 'en,
-    {
-        destream_json::encode(value)
-            .expect("encode json value")
-            .map_err(|err| err.to_string())
-            .try_fold(Vec::new(), |mut acc, chunk| async move {
-                acc.extend_from_slice(&chunk);
-                Ok(acc)
-            })
-            .await
-            .expect("collect encoded value")
-    }
-
-    async fn decode_json_value<T>(
-        stream: impl futures::Stream<Item = Result<bytes::Bytes, String>> + Send + Unpin,
-    ) -> T
-    where
-        T: de::FromStream<Context = ()>,
-    {
-        destream_json::try_decode((), stream)
-            .await
-            .expect("decode value")
-    }
-
-    #[test]
-    fn value_from_u64() {
-        let value = Value::from(123_u64);
-        assert!(matches!(value, Value::Number(Number::UInt(_))));
-    }
-
-    #[test]
-    fn value_collator_delegates_numeric_ordering() {
-        let collator = ValueCollator::default();
-
-        assert_eq!(
-            collator.cmp(&Value::from(9_000_u64), &Value::from(11_000_u64)),
-            Ordering::Less
-        );
-
-        let integer = Value::from(Number::from(9_i64));
-        let float = Value::from(Number::from(9.5_f64));
-        assert_eq!(collator.cmp(&integer, &float), Ordering::Less);
-    }
-
-    #[test]
-    fn value_collator_delegates_complex_ordering() {
-        let collator = ValueCollator::default();
-        let five = Value::from(Number::from(number_general::Complex::from([3_f32, 4_f32])));
-        let ten = Value::from(Number::from(number_general::Complex::from([6_f32, 8_f32])));
-
-        assert_eq!(collator.cmp(&five, &ten), Ordering::Less);
-    }
-
-    #[test]
-    fn value_collator_recurses_through_tuples() {
-        let collator = ValueCollator::default();
-        let left = Value::from(vec![Value::from("same"), Value::from(9_000_u64)]);
-        let right = Value::from(vec![Value::from("same"), Value::from(11_000_u64)]);
-
-        assert_eq!(collator.cmp(&left, &right), Ordering::Less);
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn json_value_cases() {
-        let cases: Vec<(&str, Value, Option<&[u8]>)> = vec![
-            ("number", Value::from(42_u64), Some(b"42")),
-            ("literal number", Value::from(7_u64), Some(b"7")),
-            (
-                "bool",
-                Value::from(Number::Bool(true.into())),
-                Some(b"true"),
-            ),
-            ("string", Value::from("hello"), Some(br#""hello""#)),
-            ("bytes", Value::from(Arc::from([0_u8, 1, 2, 255])), None),
-            (
-                "link",
-                Value::from(
-                    Link::from_str(
-                        &PathBuf::from(path_label(&["state", "scalar", "ref", "cond"])).to_string(),
-                    )
-                    .unwrap(),
-                ),
-                None,
-            ),
-            (
-                "tuple",
-                Value::from(vec![
-                    Value::from(true),
-                    Value::from(7_u64),
-                    Value::from("x"),
-                ]),
-                None,
-            ),
-        ];
-        for (name, value, literal) in &cases {
-            let encoded = encode_json_bytes(value).await;
-            assert_eq!(
-                encoded,
-                encode_json_bytes(value.clone()).await,
-                "{name}: ownership"
-            );
-            if let Some(literal) = literal {
-                assert_eq!(encoded, *literal, "{name}: wire");
-                let decoded: Value = decode_json_value(futures::stream::iter([Ok(
-                    bytes::Bytes::copy_from_slice(literal),
-                )]))
-                .await;
-                assert_eq!(&decoded, value, "{name}: literal decoding");
-            }
-            let decoded: Value =
-                decode_json_value(futures::stream::iter([Ok(bytes::Bytes::from(encoded))])).await;
-            assert_eq!(&decoded, value, "{name}: round trip");
-        }
-
-        // Preserve the original aggregate parity fixture, including its large child.
-        let values = vec![
-            Value::default(),
-            Value::from(Arc::from([0_u8, 1, 255])),
-            Value::from("/example".parse::<Link>().unwrap()),
-            cases[2].1.clone(),
-            cases[0].1.clone(),
-            Value::from("quoted \"value\""),
-            Value::from(Vec::<Value>::new()),
-            Value::from(vec![Value::from("x".repeat(200_000))]),
-        ];
-        for value in values
-            .iter()
-            .chain(std::iter::once(&Value::from(values.clone())))
-        {
-            assert_eq!(
-                encode_json_bytes(value).await,
-                encode_json_bytes(value.clone()).await
-            );
-        }
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn decode_plain_json_map_fails_closed() {
-        let stream =
-            destream_json::encode(std::collections::BTreeMap::from([("a".to_string(), 1_u64)]))
-                .expect("encode plain json map");
-
-        let decoded: Result<Value, _> = destream_json::try_decode((), stream).await;
-        assert!(decoded.is_err());
-    }
-}
+#[path = "../tests/unit/tests.rs"]
+mod tests;
 
 #[cfg(test)]
-mod allocation_tests {
-    use super::*;
-    use get_size::GetSize;
-
-    #[test]
-    fn retained_size_includes_inline_values_and_spare_nested_capacity() {
-        let mut string = String::with_capacity(64);
-        string.push_str("abc");
-        let string_capacity = string.capacity();
-        let mut values = Vec::with_capacity(8);
-        values.push(Value::default());
-        values.push(Value::from(string));
-        let capacity = values.capacity();
-        assert_eq!(Value::default().get_size(), std::mem::size_of::<Value>());
-        assert_eq!(
-            Value::from(values).get_size(),
-            std::mem::size_of::<Value>()
-                + capacity * std::mem::size_of::<Value>()
-                + string_capacity
-        );
-        let link: Link = "https://example.com/one/two/three".parse().unwrap();
-        assert!(link.get_heap_size() > 0);
-        assert!(Value::from(link).get_size() > std::mem::size_of::<Value>());
-    }
-}
+#[path = "../tests/unit/allocation_tests.rs"]
+mod allocation_tests;
 
 #[cfg(test)]
-mod lifecycle_tests;
+#[path = "../tests/unit/codec_tests.rs"]
+mod codec_tests;
