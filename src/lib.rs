@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-//! Core TinyChain value representations (WIP).
+//! Canonical TinyChain values with bounded decoding and streaming.
 
 use std::cmp::Ordering;
 use std::str::FromStr;
@@ -8,34 +8,39 @@ use std::sync::Arc;
 
 use async_hash::{Digest, Hash, Output};
 use collate::{Collate, Collator};
-use destream::{de, en, IntoStream};
-use number_general::{Number, NumberCollator};
+use get_size::GetSize;
+use number_general::{
+    ComplexType, FloatType, IntType, Number, NumberCollator, NumberInstance, UIntType,
+};
 use pathlink::{label, path_label, Label, Link, PathBuf, PathLabel, PathSegment};
-#[cfg(feature = "serialize")]
-use serde::{Deserialize, Serialize};
 
 use crate::class::{Class, NativeClass};
+
 pub mod class;
+mod stream;
 
 pub use class::{number_type_from_path, number_type_path};
 pub use number_general::NumberType;
+pub use stream::{decode_typed_value, decode_value};
 
 const VALUE_PREFIX: PathLabel = path_label(&["state", "scalar", "value"]);
 const SEGMENT_BYTES: &str = "bytes";
 const SEGMENT_LINK: &str = "link";
 const SEGMENT_NONE: &str = "none";
-const SEGMENT_NUMBER: &str = "number";
 const SEGMENT_STRING: &str = "string";
 const SEGMENT_TUPLE: &str = "tuple";
 const LABEL_BYTES: Label = label(SEGMENT_BYTES);
 const LABEL_LINK: Label = label(SEGMENT_LINK);
 const LABEL_NONE: Label = label(SEGMENT_NONE);
-const LABEL_NUMBER: Label = label(SEGMENT_NUMBER);
 const LABEL_STRING: Label = label(SEGMENT_STRING);
 const LABEL_TUPLE: Label = label(SEGMENT_TUPLE);
 
-/// High-level TinyChain value enumeration (stub).
-#[cfg_attr(feature = "serialize", derive(Serialize, Deserialize))]
+/// Maximum tuple nesting accepted by codecs and conversions into Value.
+/// Native constructors must respect this limit too; ordinary enum operations
+/// and destruction recurse through tuple children.
+pub const MAX_VALUE_DEPTH: usize = 64;
+
+/// A native scalar value. Codecs and checked conversions bound tuple nesting.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub enum Value {
     #[default]
@@ -48,6 +53,30 @@ pub enum Value {
 }
 
 impl Eq for Value {}
+
+impl Value {
+    pub fn class(&self) -> ValueType {
+        match self {
+            Self::None => ValueType::None,
+            Self::Bytes(_) => ValueType::Bytes,
+            Self::Link(_) => ValueType::Link,
+            Self::Number(number) => ValueType::Number(number.class()),
+            Self::String(_) => ValueType::String,
+            Self::Tuple(_) => ValueType::Tuple,
+        }
+    }
+
+    /// Whether this value fits within the remaining tuple nesting allowance.
+    /// Conversion boundaries subtract any enclosing Scalar tuples first.
+    pub fn within_depth(&self, remaining: usize) -> bool {
+        match self {
+            Self::Tuple(items) => {
+                remaining > 0 && items.iter().all(|item| item.within_depth(remaining - 1))
+            }
+            _ => true,
+        }
+    }
+}
 
 impl<D: Digest> Hash<D> for Value {
     fn hash(self) -> Output<D> {
@@ -63,20 +92,29 @@ impl<D: Digest> Hash<D> for &Value {
             Value::Link(link) => Hash::<D>::hash(link),
             Value::Number(number) => Hash::<D>::hash(*number),
             Value::String(string) => Hash::<D>::hash(string),
-            Value::Tuple(tuple) => Hash::<D>::hash(tuple),
+            Value::Tuple(items) if items.is_empty() => async_hash::default_hash::<D>(),
+            Value::Tuple(items) => {
+                let mut digest = D::new();
+                for item in items {
+                    digest.update(Hash::<D>::hash(item));
+                }
+                digest.finalize()
+            }
         }
     }
 }
 
-impl get_size::GetSize for Value {
-    fn get_size(&self) -> usize {
+impl GetSize for Value {
+    fn get_heap_size(&self) -> usize {
         match self {
-            Self::None => 0,
-            Self::Bytes(value) => value.get_size(),
-            Self::Link(value) => value.get_size(),
-            Self::Number(value) => value.get_size(),
-            Self::String(value) => value.get_size(),
-            Self::Tuple(value) => value.get_size(),
+            Self::Tuple(items) => {
+                items.capacity() * std::mem::size_of::<Value>()
+                    + items.iter().map(GetSize::get_heap_size).sum::<usize>()
+            }
+            Self::Bytes(bytes) => bytes.len() + 2 * std::mem::size_of::<usize>(),
+            Self::Link(link) => link.get_heap_size(),
+            Self::String(string) => string.capacity(),
+            _ => 0,
         }
     }
 }
@@ -100,43 +138,44 @@ impl Collate for ValueCollator {
             (Value::Link(left), Value::Link(right)) => self.link.cmp(left, right),
             (Value::Number(left), Value::Number(right)) => self.number.cmp(left, right),
             (Value::String(left), Value::String(right)) => self.string.cmp(left, right),
-            (Value::Tuple(left), Value::Tuple(right)) => {
-                for (left, right) in left.iter().zip(right) {
-                    match self.cmp(left, right) {
-                        Ordering::Equal => {}
-                        ordering => return ordering,
-                    }
-                }
-
-                left.len().cmp(&right.len())
-            }
-            (left, right) => left.class().cmp(&right.class()),
+            (Value::Tuple(left), Value::Tuple(right)) => left
+                .iter()
+                .zip(right)
+                .map(|(left, right)| self.cmp(left, right))
+                .find(|order| *order != Ordering::Equal)
+                .unwrap_or_else(|| left.len().cmp(&right.len())),
+            _ => left.class().cmp(&right.class()),
         }
     }
 }
 
-impl Value {
-    pub fn class(&self) -> ValueType {
-        match self {
-            Value::None => ValueType::None,
-            Value::Bytes(_) => ValueType::Bytes,
-            Value::Link(_) => ValueType::Link,
-            Value::Number(_) => ValueType::Number,
-            Value::String(_) => ValueType::String,
-            Value::Tuple(_) => ValueType::Tuple,
+macro_rules! value_from {
+    ($($ty:ty => $kind:ident),* $(,)?) => {$ (
+        impl From<$ty> for Value {
+            fn from(value: $ty) -> Self {
+                Value::$kind(value)
+            }
         }
-    }
+    )*};
+}
+
+value_from! {
+    Arc<[u8]> => Bytes,
+    Number => Number,
+    Link => Link,
+    String => String,
+    Vec<Value> => Tuple,
 }
 
 impl From<bool> for Value {
     fn from(value: bool) -> Self {
-        Value::Number(Number::from(value))
+        Number::from(value).into()
     }
 }
 
-impl From<Arc<[u8]>> for Value {
-    fn from(value: Arc<[u8]>) -> Self {
-        Value::Bytes(value)
+impl From<u64> for Value {
+    fn from(value: u64) -> Self {
+        Number::from(value).into()
     }
 }
 
@@ -148,60 +187,29 @@ impl From<Vec<u8>> for Value {
 
 impl From<bytes::Bytes> for Value {
     fn from(value: bytes::Bytes) -> Self {
-        Value::Bytes(value.to_vec().into())
-    }
-}
-
-impl From<Number> for Value {
-    fn from(n: Number) -> Self {
-        Value::Number(n)
-    }
-}
-
-impl From<Link> for Value {
-    fn from(link: Link) -> Self {
-        Value::Link(link)
-    }
-}
-
-impl From<String> for Value {
-    fn from(value: String) -> Self {
-        Value::String(value)
+        value.to_vec().into()
     }
 }
 
 impl From<&str> for Value {
     fn from(value: &str) -> Self {
-        Value::String(value.to_string())
-    }
-}
-
-impl From<u64> for Value {
-    fn from(value: u64) -> Self {
-        Value::Number(Number::from(value))
-    }
-}
-
-impl From<Vec<Value>> for Value {
-    fn from(value: Vec<Value>) -> Self {
-        Value::Tuple(value)
+        value.to_owned().into()
     }
 }
 
 impl From<()> for Value {
     fn from(_: ()) -> Self {
-        Value::None
+        Self::default()
     }
 }
 
 /// Value type paths (URI-based type declarations).
-#[cfg_attr(feature = "serialize", derive(Serialize, Deserialize))]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ValueType {
     Bytes,
     Link,
     None,
-    Number,
+    Number(NumberType),
     String,
     Tuple,
 }
@@ -212,14 +220,17 @@ impl Ord for ValueType {
             match value_type {
                 ValueType::None => 0,
                 ValueType::Bytes => 1,
-                ValueType::Number => 2,
+                ValueType::Number(_) => 2,
                 ValueType::String => 3,
                 ValueType::Link => 4,
                 ValueType::Tuple => 5,
             }
         }
 
-        rank(self).cmp(&rank(other))
+        match (self, other) {
+            (Self::Number(left), Self::Number(right)) => left.cmp(right),
+            _ => rank(self).cmp(&rank(other)),
+        }
     }
 }
 
@@ -230,6 +241,27 @@ impl PartialOrd for ValueType {
 }
 
 impl ValueType {
+    /// Whether this declaration accepts an actual type without converting its value.
+    /// Generic numerical declarations accept their family; concrete types match exactly.
+    pub fn accepts(&self, actual: &Self) -> bool {
+        match (self, actual) {
+            (Self::Number(NumberType::Number), Self::Number(_)) => true,
+            (
+                Self::Number(NumberType::Complex(ComplexType::Complex)),
+                Self::Number(NumberType::Complex(_)),
+            )
+            | (
+                Self::Number(NumberType::Float(FloatType::Float)),
+                Self::Number(NumberType::Float(_)),
+            )
+            | (Self::Number(NumberType::Int(IntType::Int)), Self::Number(NumberType::Int(_)))
+            | (Self::Number(NumberType::UInt(UIntType::UInt)), Self::Number(NumberType::UInt(_))) => {
+                true
+            }
+            _ => self == actual,
+        }
+    }
+
     fn from_suffix(path: &[PathSegment]) -> Option<&PathSegment> {
         let prefix_len = VALUE_PREFIX[..].len();
         if path.len() != prefix_len + 1 {
@@ -248,13 +280,16 @@ impl Class for ValueType {}
 
 impl NativeClass for ValueType {
     fn from_path(path: &[PathSegment]) -> Option<Self> {
+        if let Some(dtype) = number_type_from_path(path) {
+            return Some(Self::Number(dtype));
+        }
+
         let segment = Self::from_suffix(path)?;
 
         match segment.as_str() {
             SEGMENT_BYTES => Some(ValueType::Bytes),
             SEGMENT_LINK => Some(ValueType::Link),
             SEGMENT_NONE => Some(ValueType::None),
-            SEGMENT_NUMBER => Some(ValueType::Number),
             SEGMENT_STRING => Some(ValueType::String),
             SEGMENT_TUPLE => Some(ValueType::Tuple),
             _ => None,
@@ -267,214 +302,9 @@ impl NativeClass for ValueType {
             ValueType::Bytes => prefix.append(LABEL_BYTES),
             ValueType::Link => prefix.append(LABEL_LINK),
             ValueType::None => prefix.append(LABEL_NONE),
-            ValueType::Number => prefix.append(LABEL_NUMBER),
+            ValueType::Number(dtype) => number_type_path(dtype),
             ValueType::String => prefix.append(LABEL_STRING),
             ValueType::Tuple => prefix.append(LABEL_TUPLE),
-        }
-    }
-}
-
-/// Decode a typed `/state/scalar/value/...` map entry if `key` is a recognized
-/// Value type path.
-///
-/// Returns `Ok(Some(Value))` when `key` is a typed Value path and the
-/// corresponding value was decoded from `map`; otherwise returns `Ok(None)` and
-/// leaves the caller to handle the entry.
-pub async fn decode_typed_value_map_entry<A: de::MapAccess>(
-    key: &str,
-    map: &mut A,
-) -> Result<Option<Value>, A::Error> {
-    let Ok(path) = key.parse::<PathBuf>() else {
-        return Ok(None);
-    };
-
-    let Some(value_type) = ValueType::from_path(&path) else {
-        let prefix_len = VALUE_PREFIX[..].len();
-        if path.len() == prefix_len + 1 && path[..prefix_len] == VALUE_PREFIX[..] {
-            return Err(de::Error::custom(format!(
-                "unsupported value type path {path}"
-            )));
-        }
-
-        return Ok(None);
-    };
-
-    let value = match value_type {
-        ValueType::Bytes => {
-            let bytes = map.next_value::<bytes::Bytes>(()).await?;
-            Value::Bytes(bytes.to_vec().into())
-        }
-        ValueType::Number => {
-            let number = map.next_value::<Number>(()).await?;
-            Value::Number(number)
-        }
-        ValueType::None => {
-            let _ = map.next_value::<de::IgnoredAny>(()).await?;
-            Value::None
-        }
-        ValueType::String => {
-            let string = map.next_value::<String>(()).await?;
-            Value::String(string)
-        }
-        ValueType::Link => {
-            let link_raw = map.next_value::<String>(()).await?;
-            let link =
-                Link::from_str(&link_raw).map_err(|err| de::Error::custom(err.to_string()))?;
-            Value::Link(link)
-        }
-        ValueType::Tuple => {
-            let nested = map.next_value::<Vec<Value>>(()).await?;
-            Value::Tuple(nested)
-        }
-    };
-
-    // Drain trailing entries to keep decoder state in sync with tolerant v1 map
-    // semantics.
-    while map.next_key::<de::IgnoredAny>(()).await?.is_some() {
-        let _ = map.next_value::<de::IgnoredAny>(()).await?;
-    }
-
-    Ok(Some(value))
-}
-
-impl de::FromStream for Value {
-    type Context = ();
-
-    async fn from_stream<D: de::Decoder>(
-        _context: Self::Context,
-        decoder: &mut D,
-    ) -> Result<Self, D::Error> {
-        struct ValueVisitor;
-
-        impl de::Visitor for ValueVisitor {
-            type Value = Value;
-
-            fn expecting() -> &'static str {
-                "a TinyChain scalar value"
-            }
-
-            fn visit_none<E: de::Error>(self) -> Result<Self::Value, E> {
-                Ok(Value::None)
-            }
-
-            fn visit_unit<E: de::Error>(self) -> Result<Self::Value, E> {
-                Ok(Value::None)
-            }
-
-            fn visit_bool<E: de::Error>(self, value: bool) -> Result<Self::Value, E> {
-                Ok(Value::Number(Number::from(value)))
-            }
-
-            fn visit_i64<E: de::Error>(self, value: i64) -> Result<Self::Value, E> {
-                Ok(Value::Number(Number::from(value)))
-            }
-
-            fn visit_u64<E: de::Error>(self, value: u64) -> Result<Self::Value, E> {
-                Ok(Value::Number(Number::from(value)))
-            }
-
-            fn visit_f64<E: de::Error>(self, value: f64) -> Result<Self::Value, E> {
-                Ok(Value::Number(Number::from(value)))
-            }
-
-            fn visit_string<E: de::Error>(self, value: String) -> Result<Self::Value, E> {
-                Ok(Value::String(value))
-            }
-
-            async fn visit_seq<A: de::SeqAccess>(
-                self,
-                mut seq: A,
-            ) -> Result<Self::Value, A::Error> {
-                let mut items = if let Some(size) = seq.size_hint() {
-                    Vec::with_capacity(size)
-                } else {
-                    Vec::new()
-                };
-
-                while let Some(value) = seq.next_element::<Value>(()).await? {
-                    items.push(value);
-                }
-
-                Ok(Value::Tuple(items))
-            }
-
-            async fn visit_map<A: de::MapAccess>(
-                self,
-                mut map: A,
-            ) -> Result<Self::Value, A::Error> {
-                let key = map
-                    .next_key::<String>(())
-                    .await?
-                    .ok_or_else(|| de::Error::custom("expected TinyChain type path key"))?;
-
-                if let Some(value) = decode_typed_value_map_entry(&key, &mut map).await? {
-                    return Ok(value);
-                }
-
-                if let Ok(link) = Link::from_str(&key) {
-                    let _ = map.next_value::<de::IgnoredAny>(()).await?;
-                    while map.next_key::<de::IgnoredAny>(()).await?.is_some() {
-                        let _ = map.next_value::<de::IgnoredAny>(()).await?;
-                    }
-                    return Ok(Value::Link(link));
-                }
-
-                Err(de::Error::custom("map values are not supported"))
-            }
-        }
-
-        decoder.decode_any(ValueVisitor).await
-    }
-}
-
-impl<'en> en::ToStream<'en> for Value {
-    fn to_stream<E: en::Encoder<'en>>(&'en self, encoder: E) -> Result<E::Ok, E::Error> {
-        match self {
-            Value::None => encoder.encode_unit(),
-            Value::Bytes(bytes) => {
-                use destream::en::EncodeMap;
-                let mut map = encoder.encode_map(Some(1))?;
-                map.encode_entry(
-                    ValueType::Bytes.path().to_string(),
-                    bytes::Bytes::from_owner(Arc::clone(bytes)),
-                )?;
-                map.end()
-            }
-            Value::Link(link) => {
-                use destream::en::EncodeMap;
-                let mut map = encoder.encode_map(Some(1))?;
-                map.encode_entry(link.to_string(), Vec::<()>::new())?;
-                map.end()
-            }
-            Value::Number(number) => number.into_stream(encoder),
-            Value::String(string) => string.into_stream(encoder),
-            Value::Tuple(tuple) => tuple.into_stream(encoder),
-        }
-    }
-}
-
-impl<'en> en::IntoStream<'en> for Value {
-    fn into_stream<E: en::Encoder<'en>>(self, encoder: E) -> Result<E::Ok, E::Error> {
-        match self {
-            Value::None => encoder.encode_unit(),
-            Value::Bytes(bytes) => {
-                use destream::en::EncodeMap;
-                let mut map = encoder.encode_map(Some(1))?;
-                map.encode_entry(
-                    ValueType::Bytes.path().to_string(),
-                    bytes::Bytes::from_owner(bytes),
-                )?;
-                map.end()
-            }
-            Value::Link(link) => {
-                use destream::en::EncodeMap;
-                let mut map = encoder.encode_map(Some(1))?;
-                map.encode_entry(link.to_string(), Vec::<()>::new())?;
-                map.end()
-            }
-            Value::Number(number) => number.into_stream(encoder),
-            Value::String(string) => string.into_stream(encoder),
-            Value::Tuple(tuple) => tuple.into_stream(encoder),
         }
     }
 }
@@ -498,7 +328,7 @@ where
     fn opt_cast_from(value: Value) -> Option<Self> {
         match value {
             Value::Tuple(tuple) => tuple.into_iter().map(T::opt_cast_from).collect(),
-            _ => Some(vec![T::opt_cast_from(value)?]),
+            value => Some(vec![T::opt_cast_from(value)?]),
         }
     }
 }
@@ -577,9 +407,10 @@ where
         if pair.len() != 2 {
             return None;
         }
+        let mut pair = pair.into_iter();
         Some((
-            T1::opt_cast_from(pair[0].clone())?,
-            T2::opt_cast_from(pair[1].clone())?,
+            T1::opt_cast_from(pair.next()?)?,
+            T2::opt_cast_from(pair.next()?)?,
         ))
     }
 }
@@ -646,229 +477,18 @@ impl ValueType {
 
 impl safecast::CastFrom<ValueType> for Value {
     fn cast_from(dtype: ValueType) -> Self {
-        Value::String(dtype.path().to_string())
+        Value::from(dtype.path().to_string())
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use std::ops::Bound;
+#[path = "../tests/unit/tests.rs"]
+mod tests;
 
-    use futures::TryStreamExt;
+#[cfg(test)]
+#[path = "../tests/unit/allocation_tests.rs"]
+mod allocation_tests;
 
-    use super::*;
-
-    #[test]
-    fn cast_tagged_bounds() {
-        assert_eq!(
-            Bound::<Value>::opt_cast_from(Value::None),
-            Some(Bound::Unbounded)
-        );
-        assert_eq!(
-            Bound::<Value>::opt_cast_from(Value::Tuple(vec![
-                Value::from("in"),
-                Value::from(1_u64),
-            ])),
-            Some(Bound::Included(Value::from(1_u64)))
-        );
-        assert_eq!(
-            Bound::<Value>::opt_cast_from(Value::Tuple(vec![
-                Value::from("ex"),
-                Value::from(2_u64),
-            ])),
-            Some(Bound::Excluded(Value::from(2_u64)))
-        );
-    }
-
-    #[test]
-    fn reject_untagged_bounds() {
-        assert_eq!(Bound::<Value>::opt_cast_from(Value::from(1_u64)), None);
-        assert_eq!(
-            Bound::<Value>::opt_cast_from(Value::Tuple(vec![
-                Value::from("unknown"),
-                Value::from(1_u64),
-            ])),
-            None
-        );
-    }
-
-    async fn encode_json_bytes<'en, T>(value: T) -> Vec<u8>
-    where
-        T: en::IntoStream<'en> + 'en,
-    {
-        destream_json::encode(value)
-            .expect("encode json value")
-            .map_err(|err| err.to_string())
-            .try_fold(Vec::new(), |mut acc, chunk| async move {
-                acc.extend_from_slice(&chunk);
-                Ok(acc)
-            })
-            .await
-            .expect("collect encoded value")
-    }
-
-    async fn decode_json_value<T>(
-        stream: impl futures::Stream<Item = Result<bytes::Bytes, String>> + Send + Unpin,
-    ) -> T
-    where
-        T: de::FromStream<Context = ()>,
-    {
-        destream_json::try_decode((), stream)
-            .await
-            .expect("decode value")
-    }
-
-    #[test]
-    fn value_from_u64() {
-        let value = Value::from(123_u64);
-        assert!(matches!(value, Value::Number(Number::UInt(_))));
-    }
-
-    #[tokio::test]
-    async fn borrowed_encoding_matches_owned_values() {
-        let values = vec![
-            Value::None,
-            Value::Bytes(Arc::from([0_u8, 1, 255])),
-            Value::Link("/example".parse().unwrap()),
-            Value::from(true),
-            Value::from(42_u64),
-            Value::from("quoted \"value\""),
-            Value::Tuple(vec![]),
-            Value::Tuple(vec![Value::from("x".repeat(200_000))]),
-        ];
-        for value in values
-            .iter()
-            .chain(std::iter::once(&Value::Tuple(values.clone())))
-        {
-            assert_eq!(
-                encode_json_bytes(value).await,
-                encode_json_bytes(value.clone()).await
-            );
-        }
-    }
-
-    #[test]
-    fn value_collator_delegates_numeric_ordering() {
-        let collator = ValueCollator::default();
-
-        assert_eq!(
-            collator.cmp(&Value::from(9_000_u64), &Value::from(11_000_u64)),
-            Ordering::Less
-        );
-
-        let integer = Value::from(Number::from(9_i64));
-        let float = Value::from(Number::from(9.5_f64));
-        assert_eq!(collator.cmp(&integer, &float), Ordering::Less);
-    }
-
-    #[test]
-    fn value_collator_delegates_complex_ordering() {
-        let collator = ValueCollator::default();
-        let five = Value::from(Number::from(number_general::Complex::from([3_f32, 4_f32])));
-        let ten = Value::from(Number::from(number_general::Complex::from([6_f32, 8_f32])));
-
-        assert_eq!(collator.cmp(&five, &ten), Ordering::Less);
-    }
-
-    #[test]
-    fn value_collator_recurses_through_tuples() {
-        let collator = ValueCollator::default();
-        let left = Value::Tuple(vec![Value::from("same"), Value::from(9_000_u64)]);
-        let right = Value::Tuple(vec![Value::from("same"), Value::from(11_000_u64)]);
-
-        assert_eq!(collator.cmp(&left, &right), Ordering::Less);
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn roundtrip_json_number_value() {
-        let value = Value::from(42_u64);
-        let encoded = destream_json::encode(value.clone()).expect("encode number value");
-        let decoded: Value = decode_json_value(encoded.map_err(|err| err.to_string())).await;
-        assert_eq!(decoded, value);
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn roundtrip_json_bytes_value() {
-        let value = Value::Bytes(Arc::from([0_u8, 1, 2, 255]));
-        let encoded = destream_json::encode(value.clone()).expect("encode bytes value");
-        let decoded: Value = decode_json_value(encoded.map_err(|err| err.to_string())).await;
-        assert_eq!(decoded, value);
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn encode_number_value_as_plain_json_number() {
-        let value = Value::from(42_u64);
-        let bytes = encode_json_bytes(value).await;
-        assert_eq!(bytes, b"42");
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn decode_plain_json_number() {
-        let stream = destream_json::encode(7_u64).expect("encode plain json number");
-        let decoded: Value = decode_json_value(stream.map_err(|err| err.to_string())).await;
-        assert_eq!(decoded, Value::from(7_u64));
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn decode_plain_json_bool() {
-        let stream = destream_json::encode(true).expect("encode plain json bool");
-        let decoded: Value = decode_json_value(stream.map_err(|err| err.to_string())).await;
-        assert_eq!(decoded, Value::Number(Number::Bool(true.into())));
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn encode_bool_value_as_plain_json_bool() {
-        let value = Value::Number(Number::Bool(true.into()));
-        let bytes = encode_json_bytes(value).await;
-        assert_eq!(bytes, b"true");
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn roundtrip_string_value() {
-        let value = Value::from("hello");
-        let encoded = destream_json::encode(value.clone()).expect("encode string value");
-        let decoded: Value = decode_json_value(encoded.map_err(|err| err.to_string())).await;
-        assert_eq!(decoded, value);
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn encode_string_value_as_plain_json_string() {
-        let value = Value::from("hello");
-        let bytes = encode_json_bytes(value).await;
-        assert_eq!(bytes, br#""hello""#);
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn roundtrip_link_value() {
-        let link = Link::from_str(
-            &PathBuf::from(path_label(&["state", "scalar", "ref", "cond"])).to_string(),
-        )
-        .expect("link");
-        let value = Value::from(link);
-        let encoded = destream_json::encode(value.clone()).expect("encode link value");
-        let decoded: Value = decode_json_value(encoded.map_err(|err| err.to_string())).await;
-        assert_eq!(decoded, value);
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn roundtrip_tuple_value() {
-        let value = Value::Tuple(vec![
-            Value::Number(Number::Bool(true.into())),
-            Value::from(7_u64),
-            Value::from("x"),
-        ]);
-        let encoded = destream_json::encode(value.clone()).expect("encode tuple value");
-        let decoded: Value = decode_json_value(encoded.map_err(|err| err.to_string())).await;
-        assert_eq!(decoded, value);
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn decode_plain_json_map_fails_closed() {
-        let stream =
-            destream_json::encode(std::collections::BTreeMap::from([("a".to_string(), 1_u64)]))
-                .expect("encode plain json map");
-
-        let decoded: Result<Value, _> = destream_json::try_decode((), stream).await;
-        assert!(decoded.is_err());
-    }
-}
+#[cfg(test)]
+#[path = "../tests/unit/codec_tests.rs"]
+mod codec_tests;
