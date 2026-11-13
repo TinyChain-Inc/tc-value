@@ -4,7 +4,7 @@ use std::sync::Arc;
 use destream::de::FromStream;
 use destream::en::EncodeMap;
 use destream::{de, en, IntoStream};
-use number_general::{Number, NumberInstance};
+use number_general::{Float, FloatType, Number, NumberClass, NumberInstance};
 use pathlink::{Link, PathBuf};
 
 use crate::class::NativeClass;
@@ -65,16 +65,27 @@ async fn decode_leaf<D: de::Decoder>(
             let number = if dtype == crate::NumberType::Complex(number_general::ComplexType::C32)
                 && decoder.peek_kind().await? == de::Kind::Seq
             {
-                // TBON preserves f32 components; its f64 decoder cannot read them.
-                let components = <[f32; 2]>::from_stream((), decoder).await?;
-                Number::from(number_general::Complex::from(components))
+                // Preserve the input width until conversion: decoding directly as
+                // f32 could already lose a nonzero component to zero.
+                let [re, im] = <[Number; 2]>::from_stream((), decoder).await?;
+                if !re.is_real() || !im.is_real() {
+                    return Err(de::Error::custom("expected real complex components"));
+                }
+                let re = FloatType::F32.try_cast(re).map_err(de::Error::custom)?;
+                let im = FloatType::F32.try_cast(im).map_err(de::Error::custom)?;
+                let (Float::F32(re), Float::F32(im)) = (re, im) else {
+                    unreachable!("checked f32 component conversion")
+                };
+                Number::from(number_general::Complex::from([re, im]))
             } else {
                 Number::from_stream((), decoder).await?
             };
             decoder.finish_child(map).await?;
-            // An explicit wire tag requests conversion, as in v1.
-            // Schema membership checks remain noncoercing.
-            number.into_type(dtype).into()
+            // Explicit tags request checked conversion; schemas remain noncoercing.
+            number
+                .try_into_type(dtype)
+                .map_err(de::Error::custom)?
+                .into()
         }
         ValueType::None => {
             de::IgnoredAny::from_stream((), decoder).await?;
@@ -222,7 +233,7 @@ impl de::Visitor for LeafVisitor {
     }
 
     fn visit_i64<E: de::Error>(self, value: i64) -> Result<Value, E> {
-        Ok(Number::from(value).into())
+        Ok(value.into())
     }
 
     fn visit_u64<E: de::Error>(self, value: u64) -> Result<Value, E> {
@@ -230,7 +241,7 @@ impl de::Visitor for LeafVisitor {
     }
 
     fn visit_f64<E: de::Error>(self, value: f64) -> Result<Value, E> {
-        Ok(Number::from(value).into())
+        Ok(value.into())
     }
 
     fn visit_string<E: de::Error>(self, value: String) -> Result<Value, E> {

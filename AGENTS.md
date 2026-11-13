@@ -17,6 +17,15 @@ strings, and tuples.
 - Reuse shared primitives such as `Number` from `number-general`. Do not
   introduce crate-specific wrapper structs unless they are
   reusable by `tc-state`, `tc-collection`, and adapters.
+- Numerical behavior belongs to `number-general`; public handlers belong to
+  `tc-state`. Use checked `try_*` operations and casts at fallible request
+  boundaries. Do not add parallel arithmetic or routing implementations here.
+- Own Value-only leaf inspection, equality-operation semantics, and text
+  conversion here. `TryCastFrom<Value> for String` accepts strings, numbers,
+  and links; borrowed `Cow<str>` conversion preserves existing string storage.
+  This replaces `Value::to_text`; borrowed `&str` inspection remains string-only.
+  State delegates those operations and retains universal container traversal,
+  request errors, routing, and execution.
 - `Value` has intrinsic equality but no intrinsic ordering. All ordered storage,
   ranges, and stream merges must use `ValueCollator`, which delegates numbers to
   `NumberCollator` and recursively collates tuples. Do not implement `Ord` or
