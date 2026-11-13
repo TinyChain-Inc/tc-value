@@ -2,6 +2,7 @@
 
 //! Canonical TinyChain values with bounded decoding and streaming.
 
+use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -9,10 +10,12 @@ use std::sync::Arc;
 use async_hash::{Digest, Hash, Output};
 use collate::{Collate, Collator};
 use get_size::GetSize;
+use hr_id::Id;
 use number_general::{
     ComplexType, FloatType, IntType, Number, NumberCollator, NumberInstance, UIntType,
 };
 use pathlink::{label, path_label, Label, Link, PathBuf, PathLabel, PathSegment};
+use safecast::{CastFrom, TryCastFrom};
 
 use crate::class::{Class, NativeClass};
 
@@ -167,17 +170,17 @@ value_from! {
     Vec<Value> => Tuple,
 }
 
-impl From<bool> for Value {
-    fn from(value: bool) -> Self {
-        Number::from(value).into()
-    }
+macro_rules! value_number {
+    ($($ty:ty),+ $(,)?) => {$(
+        impl From<$ty> for Value {
+            fn from(value: $ty) -> Self {
+                Number::from(value).into()
+            }
+        }
+    )+};
 }
 
-impl From<u64> for Value {
-    fn from(value: u64) -> Self {
-        Number::from(value).into()
-    }
-}
+value_number!(bool, i8, i16, i32, i64, u8, u16, u32, u64, f32, f64);
 
 impl From<Vec<u8>> for Value {
     fn from(value: Vec<u8>) -> Self {
@@ -187,7 +190,7 @@ impl From<Vec<u8>> for Value {
 
 impl From<bytes::Bytes> for Value {
     fn from(value: bytes::Bytes) -> Self {
-        value.to_vec().into()
+        Self::Bytes(Arc::from(value.as_ref()))
     }
 }
 
@@ -203,41 +206,15 @@ impl From<()> for Value {
     }
 }
 
-/// Value type paths (URI-based type declarations).
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// Value type paths. Declaration order defines canonical cross-kind collation.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum ValueType {
-    Bytes,
-    Link,
     None,
+    Bytes,
     Number(NumberType),
     String,
+    Link,
     Tuple,
-}
-
-impl Ord for ValueType {
-    fn cmp(&self, other: &Self) -> Ordering {
-        fn rank(value_type: &ValueType) -> u8 {
-            match value_type {
-                ValueType::None => 0,
-                ValueType::Bytes => 1,
-                ValueType::Number(_) => 2,
-                ValueType::String => 3,
-                ValueType::Link => 4,
-                ValueType::Tuple => 5,
-            }
-        }
-
-        match (self, other) {
-            (Self::Number(left), Self::Number(right)) => left.cmp(right),
-            _ => rank(self).cmp(&rank(other)),
-        }
-    }
-}
-
-impl PartialOrd for ValueType {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
 }
 
 impl ValueType {
@@ -297,22 +274,93 @@ impl NativeClass for ValueType {
     }
 
     fn path(&self) -> PathBuf {
-        let prefix = PathBuf::from(VALUE_PREFIX);
-        match self {
-            ValueType::Bytes => prefix.append(LABEL_BYTES),
-            ValueType::Link => prefix.append(LABEL_LINK),
-            ValueType::None => prefix.append(LABEL_NONE),
-            ValueType::Number(dtype) => number_type_path(dtype),
-            ValueType::String => prefix.append(LABEL_STRING),
-            ValueType::Tuple => prefix.append(LABEL_TUPLE),
-        }
+        let suffix = match self {
+            Self::Number(dtype) => return number_type_path(dtype),
+            Self::Bytes => LABEL_BYTES,
+            Self::Link => LABEL_LINK,
+            Self::None => LABEL_NONE,
+            Self::String => LABEL_STRING,
+            Self::Tuple => LABEL_TUPLE,
+        };
+
+        PathBuf::from(VALUE_PREFIX).append(suffix)
     }
 }
 
 // ─── safecast impls for request parsing ────────────────────────────────
 
-use hr_id::Id;
-use safecast::TryCastFrom;
+// Inspection recognizes only the embedded variant; it never coerces or clones payloads.
+impl TryCastFrom<&Value> for Number {
+    fn can_cast_from(value: &&Value) -> bool {
+        Self::opt_cast_from(*value).is_some()
+    }
+
+    fn opt_cast_from(value: &Value) -> Option<Self> {
+        match value {
+            Value::Number(number) => Some(*number),
+            _ => None,
+        }
+    }
+}
+
+impl TryCastFrom<Value> for Number {
+    fn can_cast_from(value: &Value) -> bool {
+        matches!(value, Value::Number(_))
+    }
+
+    fn opt_cast_from(value: Value) -> Option<Self> {
+        Self::opt_cast_from(&value)
+    }
+}
+
+impl TryCastFrom<Value> for Link {
+    fn can_cast_from(value: &Value) -> bool {
+        match value {
+            Value::Link(_) => true,
+            Value::String(string) => string.parse::<Self>().is_ok(),
+            _ => false,
+        }
+    }
+
+    fn opt_cast_from(value: Value) -> Option<Self> {
+        match value {
+            Value::Link(link) => Some(link),
+            Value::String(string) => string.parse().ok(),
+            _ => None,
+        }
+    }
+}
+
+impl TryCastFrom<Value> for PathBuf {
+    fn can_cast_from(value: &Value) -> bool {
+        match value {
+            Value::Link(link) => link.host().is_none(),
+            Value::String(string) => string.parse::<Self>().is_ok(),
+            _ => false,
+        }
+    }
+
+    fn opt_cast_from(value: Value) -> Option<Self> {
+        match value {
+            Value::Link(link) if link.host().is_none() => Some(link.into_path()),
+            Value::String(string) => string.parse().ok(),
+            _ => None,
+        }
+    }
+}
+
+impl<'a> TryCastFrom<&'a Value> for &'a str {
+    fn can_cast_from(value: &&'a Value) -> bool {
+        Self::opt_cast_from(*value).is_some()
+    }
+
+    fn opt_cast_from(value: &'a Value) -> Option<Self> {
+        match value {
+            Value::String(string) => Some(string),
+            _ => None,
+        }
+    }
+}
 
 impl<T> TryCastFrom<Value> for Vec<T>
 where
@@ -333,14 +381,34 @@ where
     }
 }
 
+/// Convert scalar text, moving existing strings and formatting numbers or links.
+/// Bytes, tuples, and None have no string conversion.
 impl TryCastFrom<Value> for String {
     fn can_cast_from(value: &Value) -> bool {
-        matches!(value, Value::String(_))
+        matches!(value, Value::String(_) | Value::Number(_) | Value::Link(_))
     }
 
     fn opt_cast_from(value: Value) -> Option<Self> {
         match value {
-            Value::String(s) => Some(s),
+            Value::String(string) => Some(string),
+            Value::Number(number) => Some(number.to_string()),
+            Value::Link(link) => Some(link.to_string()),
+            _ => None,
+        }
+    }
+}
+
+/// Borrow existing strings during scoped conversion; formatted values are owned.
+impl<'a> TryCastFrom<&'a Value> for Cow<'a, str> {
+    fn can_cast_from(value: &&'a Value) -> bool {
+        String::can_cast_from(*value)
+    }
+
+    fn opt_cast_from(value: &'a Value) -> Option<Self> {
+        match value {
+            Value::String(string) => Some(Cow::Borrowed(string)),
+            Value::Number(number) => Some(Cow::Owned(number.to_string())),
+            Value::Link(link) => Some(Cow::Owned(link.to_string())),
             _ => None,
         }
     }
@@ -388,32 +456,37 @@ impl TryCastFrom<Value> for Id {
     }
 }
 
-impl<T1, T2> TryCastFrom<Value> for (T1, T2)
-where
-    T1: TryCastFrom<Value>,
-    T2: TryCastFrom<Value>,
-{
-    fn can_cast_from(value: &Value) -> bool {
-        let Value::Tuple(pair) = value else {
-            return false;
-        };
-        pair.len() == 2 && T1::can_cast_from(&pair[0]) && T2::can_cast_from(&pair[1])
-    }
+macro_rules! value_tuple {
+    ($length:literal; $($ty:ident: $index:tt),+ $(,)?) => {
+        impl<$($ty: TryCastFrom<Value>),+> TryCastFrom<Value> for ($($ty,)+) {
+            fn can_cast_from(value: &Value) -> bool {
+                match value {
+                    Value::Tuple(items) => {
+                        items.len() == $length $(&& $ty::can_cast_from(&items[$index]))+
+                    }
+                    _ => false,
+                }
+            }
 
-    fn opt_cast_from(value: Value) -> Option<Self> {
-        let Value::Tuple(pair) = value else {
-            return None;
-        };
-        if pair.len() != 2 {
-            return None;
+            fn opt_cast_from(value: Value) -> Option<Self> {
+                let Value::Tuple(items) = value else {
+                    return None;
+                };
+
+                if items.len() != $length {
+                    return None;
+                }
+
+                let mut items = items.into_iter();
+                Some(($($ty::opt_cast_from(items.next()?)?,)+))
+            }
         }
-        let mut pair = pair.into_iter();
-        Some((
-            T1::opt_cast_from(pair.next()?)?,
-            T2::opt_cast_from(pair.next()?)?,
-        ))
-    }
+    };
 }
+
+value_tuple!(1; T1: 0);
+value_tuple!(2; T1: 0, T2: 1);
+value_tuple!(3; T1: 0, T2: 1, T3: 2);
 
 impl TryCastFrom<Value> for bool {
     fn can_cast_from(value: &Value) -> bool {
@@ -422,10 +495,7 @@ impl TryCastFrom<Value> for bool {
 
     fn opt_cast_from(value: Value) -> Option<Self> {
         match value {
-            Value::Number(n) => {
-                use safecast::CastFrom;
-                Some(u64::cast_from(n) != 0)
-            }
+            Value::Number(number) => Some(bool::cast_from(number)),
             Value::None => Some(false),
             _ => None,
         }
@@ -434,7 +504,13 @@ impl TryCastFrom<Value> for bool {
 
 impl TryCastFrom<Value> for std::ops::Bound<Value> {
     fn can_cast_from(value: &Value) -> bool {
-        Self::opt_cast_from(value.clone()).is_some()
+        match value {
+            Value::None => true,
+            Value::Tuple(pair) if pair.len() == 2 => {
+                matches!(&pair[0], Value::String(tag) if tag == "in" || tag == "ex")
+            }
+            _ => false,
+        }
     }
 
     fn opt_cast_from(value: Value) -> Option<Self> {

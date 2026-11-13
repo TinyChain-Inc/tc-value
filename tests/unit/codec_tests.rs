@@ -8,7 +8,9 @@ use collate::Collate;
 use destream::{en, IntoStream};
 use futures::{FutureExt, StreamExt, TryStreamExt};
 use get_size::GetSize;
-use number_general::Number;
+use number_general::{Complex, ComplexType, FloatType, IntType, Number, NumberType, UIntType};
+
+use safecast::TryCastFrom;
 
 use super::tests::nested;
 use crate::class::NativeClass;
@@ -192,6 +194,101 @@ async fn typed_payload_validation_and_extra_entries_preserve_wire_behavior() {
             assert!(class.accepts(&value.class()), "{codec:?}: {suffix}");
         }
 
+        for (dtype, number, expected) in [
+            (
+                NumberType::Int(IntType::I8),
+                Number::from(-128i64),
+                Number::from(-128i8),
+            ),
+            (
+                NumberType::Int(IntType::I8),
+                Number::from(127f64),
+                Number::from(127i8),
+            ),
+            (
+                NumberType::UInt(UIntType::U8),
+                Number::from(255u64),
+                Number::from(255u8),
+            ),
+            (NumberType::Bool, Number::from(0u64), Number::from(false)),
+            (NumberType::Bool, Number::from(1u64), Number::from(true)),
+            (
+                NumberType::Float(FloatType::F32),
+                Number::from(1.1f64),
+                Number::from(1.1f32),
+            ),
+            (
+                NumberType::Float(FloatType::F32),
+                Number::from(-0.0f64),
+                Number::from(-0.0f32),
+            ),
+            (
+                NumberType::Float(FloatType::F32),
+                Number::from(f64::from(f32::MIN_POSITIVE * f32::EPSILON)),
+                Number::from(f32::MIN_POSITIVE * f32::EPSILON),
+            ),
+            (
+                NumberType::Complex(ComplexType::C32),
+                Number::from(Complex::from([1.1f64, 2.2])),
+                Number::from(Complex::from([1.1f32, 2.2])),
+            ),
+            (
+                NumberType::Complex(ComplexType::C32),
+                Number::from(Complex::from([1f32, f32::MIN_POSITIVE * f32::EPSILON])),
+                Number::from(Complex::from([1f32, f32::MIN_POSITIVE * f32::EPSILON])),
+            ),
+        ] {
+            let class = ValueType::Number(dtype);
+            let input = std::collections::BTreeMap::from([(class.path().to_string(), number)]);
+            let bytes = codec.encode(input).await;
+            let decoded = codec.decode(bytes, 1).await.unwrap();
+            assert_eq!(decoded, Value::Number(expected), "{codec:?}: {dtype:?}");
+            assert!(class.accepts(&decoded.class()));
+            // JSON may encode floating -0 as integer zero; TBON retains its dtype.
+            if let (Codec::Tbon, Value::Number(Number::Float(value)), Number::Float(expected)) =
+                (codec, decoded, expected)
+            {
+                assert_eq!(
+                    f64::from(value).is_sign_negative(),
+                    f64::from(expected).is_sign_negative()
+                );
+            }
+        }
+
+        for (dtype, number) in [
+            (NumberType::Int(IntType::I8), Number::from(128i64)),
+            (NumberType::Int(IntType::I8), Number::from(-129i64)),
+            (NumberType::Int(IntType::I8), Number::from(1.5f64)),
+            (NumberType::Int(IntType::I64), Number::from(u64::MAX)),
+            (NumberType::UInt(UIntType::U8), Number::from(-1i64)),
+            (NumberType::Bool, Number::from(2u64)),
+            (NumberType::Float(FloatType::F32), Number::from(f64::MAX)),
+            (
+                NumberType::Float(FloatType::F32),
+                Number::from(f64::MIN_POSITIVE),
+            ),
+            (
+                NumberType::Int(IntType::I64),
+                Number::from(Complex::from([1f64, 1.])),
+            ),
+            (
+                NumberType::Complex(ComplexType::C32),
+                Number::from(Complex::from([1f64, f64::MIN_POSITIVE])),
+            ),
+            (
+                NumberType::Complex(ComplexType::C32),
+                Number::from(Complex::from([f64::MAX, 1f64])),
+            ),
+        ] {
+            let class = ValueType::Number(dtype);
+            let input = std::collections::BTreeMap::from([(class.path().to_string(), number)]);
+            let bytes = codec.encode(input).await;
+            assert!(
+                codec.decode(bytes, 1).await.is_err(),
+                "{codec:?}: {dtype:?}"
+            );
+        }
+
         for number in [
             Number::from(number_general::Complex::from([3_f32, 4_f32])),
             Number::from(number_general::Complex::from([3_f64, 4_f64])),
@@ -205,6 +302,15 @@ async fn typed_payload_validation_and_extra_entries_preserve_wire_behavior() {
         }
     }
 
+    let float_path = ValueType::Number(NumberType::Float(FloatType::F32)).path();
+    let input = format!("{{\"{float_path}\":-0.0}}");
+    let Value::Number(Number::Float(value)) =
+        Codec::Json.decode(input.into_bytes(), 1).await.unwrap()
+    else {
+        panic!("typed float")
+    };
+    assert!(f64::from(value).is_sign_negative());
+
     for input in [
         r#"{"/state/scalar/value/tuple":null}"#,
         r#"{"/state/scalar/value/unsupported":null}"#,
@@ -212,6 +318,7 @@ async fn typed_payload_validation_and_extra_entries_preserve_wire_behavior() {
         r#"{"/state/scalar/value/number/uint/64":"not a number"}"#,
         r#"{"/state/scalar/value/number/complex/32":[3]}"#,
         r#"{"/state/scalar/value/number/complex/32":[3,4,5]}"#,
+        r#"{"/state/scalar/value/number/complex/32":[[1,0],2]}"#,
         r#"{}"#,
     ] {
         assert!(
@@ -279,4 +386,58 @@ async fn typed_link_validates_its_separator_before_parsing_the_link() {
             .to_string();
         assert_eq!(current, previous, "{input}");
     }
+}
+
+#[tokio::test]
+async fn link_uri_keys_remain_distinct_from_literal_paths() {
+    for name in ["λ", "literal%name", "%2f"] {
+        let path = pathlink::PathBuf::from(name.parse::<pathlink::Id>().unwrap());
+        let link = pathlink::Link::from(path.clone());
+        let value = Value::from(link.clone());
+        assert_ne!(path.to_string(), link.to_string());
+        let encoded = destream_json::encode(value.clone()).unwrap();
+        let decoded: Value = destream_json::try_decode((), encoded).await.unwrap();
+        assert_eq!(decoded, value);
+        let encoded = tbon::en::encode(&value).unwrap();
+        let decoded: Value = tbon::de::try_decode((), encoded).await.unwrap();
+        assert_eq!(decoded, value);
+    }
+}
+
+#[tokio::test]
+async fn byte_conversion_preserves_owned_and_borrowed_wire_data() {
+    let unique = Bytes::from(vec![1_u8, 2]);
+    assert!(unique.is_unique());
+    let unique = Value::from(unique);
+    assert_eq!(
+        Arc::<[u8]>::opt_cast_from(unique).unwrap().as_ref(),
+        &[1, 2]
+    );
+
+    let original = Bytes::from(vec![0_u8, 1, 127, 255]);
+    let alias = original.clone();
+    for input in [
+        Bytes::new(),
+        original,
+        alias.slice(1..3),
+        Bytes::from_static(b"static"),
+    ] {
+        let expected = input.to_vec();
+        let retained = input.clone();
+        let value = Value::from(input);
+        assert_eq!(retained.as_ref(), expected.as_slice());
+        drop(retained);
+        let Value::Bytes(payload) = &value else {
+            panic!("bytes")
+        };
+
+        assert_eq!(payload.as_ref(), expected.as_slice());
+        for codec in [Codec::Json, Codec::Tbon] {
+            let borrowed = codec.encode(&value).await;
+            assert_eq!(borrowed, codec.encode(value.clone()).await);
+            assert_eq!(codec.decode(borrowed, 1).await.unwrap(), value);
+        }
+    }
+
+    assert_eq!(alias.as_ref(), &[0, 1, 127, 255]);
 }
