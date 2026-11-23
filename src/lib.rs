@@ -8,7 +8,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use async_hash::{Digest, Hash, Output};
-use collate::{Collate, Collator};
+use collate::Collate;
 use get_size::GetSize;
 use hr_id::Id;
 use number_general::{
@@ -22,8 +22,9 @@ use crate::class::{Class, NativeClass};
 pub mod class;
 mod stream;
 
-pub use class::{number_type_from_path, number_type_path};
 pub use number_general::NumberType;
+
+pub use class::{number_type_from_path, number_type_path};
 pub use stream::{decode_typed_value, decode_value};
 
 const VALUE_PREFIX: PathLabel = path_label(&["state", "scalar", "value"]);
@@ -122,13 +123,11 @@ impl GetSize for Value {
     }
 }
 
-/// Defines the canonical collation order for [`Value`].
+/// Orders native values, delegating numbers to [`NumberCollator`] and recursing
+/// through tuples. Collation equality preserves native equality.
 #[derive(Copy, Clone, Default, Eq, PartialEq)]
 pub struct ValueCollator {
-    bytes: Collator<Arc<[u8]>>,
-    link: Collator<Link>,
     number: NumberCollator,
-    string: Collator<String>,
 }
 
 impl Collate for ValueCollator {
@@ -136,17 +135,16 @@ impl Collate for ValueCollator {
 
     fn cmp(&self, left: &Value, right: &Value) -> Ordering {
         match (left, right) {
-            (Value::None, Value::None) => Ordering::Equal,
-            (Value::Bytes(left), Value::Bytes(right)) => self.bytes.cmp(left, right),
-            (Value::Link(left), Value::Link(right)) => self.link.cmp(left, right),
             (Value::Number(left), Value::Number(right)) => self.number.cmp(left, right),
-            (Value::String(left), Value::String(right)) => self.string.cmp(left, right),
             (Value::Tuple(left), Value::Tuple(right)) => left
                 .iter()
                 .zip(right)
                 .map(|(left, right)| self.cmp(left, right))
-                .find(|order| *order != Ordering::Equal)
+                .find(|order| !order.is_eq())
                 .unwrap_or_else(|| left.len().cmp(&right.len())),
+            (Value::Bytes(left), Value::Bytes(right)) => left.cmp(right),
+            (Value::Link(left), Value::Link(right)) => left.cmp(right),
+            (Value::String(left), Value::String(right)) => left.cmp(right),
             _ => left.class().cmp(&right.class()),
         }
     }
@@ -542,6 +540,7 @@ impl TryCastFrom<Value> for ValueType {
 impl ValueType {
     fn opt_cast_from_ref(value: &Value) -> Option<Self> {
         match value {
+            Value::Link(link) if link.host().is_none() => NativeClass::from_path(link.path()),
             Value::String(s) => {
                 let path = pathlink::PathBuf::from_str(s).ok()?;
                 NativeClass::from_path(&path)
@@ -553,18 +552,16 @@ impl ValueType {
 
 impl safecast::CastFrom<ValueType> for Value {
     fn cast_from(dtype: ValueType) -> Self {
-        Value::from(dtype.path().to_string())
+        Value::Link(dtype.path().into())
     }
 }
 
 #[cfg(test)]
-#[path = "../tests/unit/tests.rs"]
-mod tests;
-
-#[cfg(test)]
 #[path = "../tests/unit/allocation_tests.rs"]
 mod allocation_tests;
-
 #[cfg(test)]
 #[path = "../tests/unit/codec_tests.rs"]
 mod codec_tests;
+#[cfg(test)]
+#[path = "../tests/unit/tests.rs"]
+mod tests;

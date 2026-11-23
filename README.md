@@ -1,5 +1,12 @@
 # tc-value
 
+`ValueCollator` supplies one ordering for ranges and stored values. It delegates
+numbers to `NumberCollator` and recursively compares tuple elements. Complex
+numbers compare by norm, then real and imaginary components when norms tie.
+Collation equality matches native equality, including normalized NaNs, signed
+zero, and mixed numeric representations. Storage owners use this comparator
+within their ordinary prefix and complete-key comparison APIs.
+
 Borrowed `ToStream` encoding delegates through native values without cloning
 strings or tuple trees. Byte values retain shared ownership of their payload;
 owned and borrowed encoding produce the same representation.
@@ -88,6 +95,18 @@ The wire representation is unchanged; explicit lossy conversions remain availabl
 through `number-general`'s native casting APIs. Ordinary literals do not need tags.
 Text codecs may infer a different integer width or signedness without changing
 the numerical value.
+
+Literal Links encode as URI text. Bare value strings containing valid hostless
+paths or supported HTTP/HTTPS URIs decode as Links; other text remains String.
+A String containing valid Link text uses its explicit String tag. Explicit Link
+and String tags remain strict typed inputs; malformed recognized tags are errors.
+Typed string fields and map keys retain their own meaning without inference.
+Typed-value envelopes contain exactly one entry, and typed None requires an
+actual unit/null payload. Additional entries and malformed payloads are errors;
+decoders do not traverse unwanted extra payloads.
+URI-keyed maps are not a literal-Link representation. Completed decoded tuples,
+strings, and path segments discard spare
+capacity so incremental decoding does not inflate their retained footprint.
 
 ```bash
 cargo test --all-targets --all-features

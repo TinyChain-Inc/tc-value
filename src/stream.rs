@@ -10,13 +10,11 @@ use pathlink::{Link, PathBuf};
 use crate::class::NativeClass;
 use crate::{Value, ValueType, VALUE_PREFIX};
 
-fn typed_value<E: de::Error>(key: &str) -> Result<Option<ValueType>, E> {
-    let Ok(path) = key.parse::<PathBuf>() else {
-        return Ok(None);
-    };
-    if let Some(class) = ValueType::from_path(&path) {
+fn typed_value<E: de::Error>(path: &PathBuf) -> Result<Option<ValueType>, E> {
+    if let Some(class) = ValueType::from_path(path) {
         return Ok(Some(class));
     }
+
     let prefix_len = VALUE_PREFIX[..].len();
     if path.len() == prefix_len + 1 && path[..prefix_len] == VALUE_PREFIX[..] {
         return Err(E::custom(format!("unsupported value type path {path}")));
@@ -26,17 +24,18 @@ fn typed_value<E: de::Error>(key: &str) -> Result<Option<ValueType>, E> {
 
 /// Decode the payload of a recognized Value type path at the current decoder slot.
 /// Recognized payloads complete their current map child before returning. Unknown
-/// keys leave both input and cursor untouched. The caller owns any remaining map
-/// entries and their validation policy.
+/// paths leave both input and cursor untouched. The caller requires the map to
+/// end immediately after the payload.
 pub async fn decode_typed_value<D: de::Decoder>(
-    key: &str,
+    path: &PathBuf,
     decoder: &mut D,
     map: &mut de::Container,
     remaining: usize,
 ) -> Result<Option<Value>, D::Error> {
-    let Some(class) = typed_value::<D::Error>(key)? else {
+    let Some(class) = typed_value::<D::Error>(path)? else {
         return Ok(None);
     };
+
     let value = if class == ValueType::Tuple {
         if decoder.peek_kind().await? != de::Kind::Seq {
             return Err(de::Error::custom("expected a tuple payload"));
@@ -88,7 +87,7 @@ async fn decode_leaf<D: de::Decoder>(
                 .into()
         }
         ValueType::None => {
-            de::IgnoredAny::from_stream((), decoder).await?;
+            <()>::from_stream((), decoder).await?;
             decoder.finish_child(map).await?;
             Value::default()
         }
@@ -108,15 +107,11 @@ async fn decode_leaf<D: de::Decoder>(
     })
 }
 
-async fn drain_map<D: de::Decoder>(
-    decoder: &mut D,
-    mut map: de::Container,
-) -> Result<(), D::Error> {
-    // Preserve the canonical typed-value map's existing tolerance of extra entries.
-    while map.slot() != de::Slot::End {
-        de::IgnoredAny::from_stream((), decoder).await?;
-        decoder.finish_child(&mut map).await?;
+fn end_map<E: de::Error>(map: &de::Container) -> Result<(), E> {
+    if map.slot() != de::Slot::End {
+        return Err(E::custom("unexpected extra Value type map entry"));
     }
+
     Ok(())
 }
 
@@ -153,27 +148,26 @@ pub async fn decode_value<D: de::Decoder>(
                 }
                 let key = String::from_stream((), decoder).await?;
                 decoder.finish_child(&mut map).await?;
-                match typed_value::<D::Error>(&key)? {
+                let class = match key.parse::<PathBuf>() {
+                    Ok(path) => typed_value::<D::Error>(&path)?,
+                    Err(_) => None,
+                };
+
+                match class {
                     Some(ValueType::Tuple) => {
                         wrapper = Some(map);
                         None
                     }
                     Some(class) => {
                         let value = decode_leaf(class, decoder, &mut map).await?;
-                        drain_map(decoder, map).await?;
+                        end_map::<D::Error>(&map)?;
                         Some(value)
                     }
-                    None => {
-                        let link = Link::from_str(&key)
-                            .map_err(|_| de::Error::custom("map values are not supported"))?;
-                        de::IgnoredAny::from_stream((), decoder).await?;
-                        decoder.finish_child(&mut map).await?;
-                        drain_map(decoder, map).await?;
-                        Some(link.into())
-                    }
+                    None => return Err(de::Error::custom("map values are not supported")),
                 }
             }
         };
+
         if value.is_none() {
             if frames.len() >= remaining.min(crate::MAX_VALUE_DEPTH) {
                 return Err(de::Error::custom("Value tuple nesting exceeds 64"));
@@ -205,14 +199,28 @@ pub async fn decode_value<D: de::Decoder>(
             let frame = frames.pop().expect("completed sequence");
             if let Some(mut map) = frame.wrapper {
                 decoder.finish_child(&mut map).await?;
-                drain_map(decoder, map).await?;
+                end_map::<D::Error>(&map)?;
             }
-            value = Some(frame.items.into());
+
+            value = Some(frame.items.into_boxed_slice().into_vec().into());
         }
     }
 }
 
 struct LeafVisitor;
+
+fn encode_string<'en, E: en::Encoder<'en>>(
+    string: impl AsRef<str> + IntoStream<'en> + 'en,
+    encoder: E,
+) -> Result<E::Ok, E::Error> {
+    if string.as_ref().parse::<Link>().is_ok() {
+        let mut map = encoder.encode_map(Some(1))?;
+        map.encode_entry(ValueType::String.path(), string)?;
+        map.end()
+    } else {
+        string.into_stream(encoder)
+    }
+}
 
 impl de::Visitor for LeafVisitor {
     type Value = Value;
@@ -245,7 +253,10 @@ impl de::Visitor for LeafVisitor {
     }
 
     fn visit_string<E: de::Error>(self, value: String) -> Result<Value, E> {
-        Ok(value.into())
+        Ok(match value.parse::<Link>().ok() {
+            Some(link) => link.into(),
+            None => value.into_boxed_str().into_string().into(),
+        })
     }
 }
 
@@ -256,23 +267,20 @@ impl<'en> en::ToStream<'en> for Value {
             Value::Bytes(bytes) => {
                 let mut map = encoder.encode_map(Some(1))?;
                 map.encode_entry(
-                    ValueType::Bytes.path().to_string(),
+                    ValueType::Bytes.path(),
                     bytes::Bytes::from_owner(Arc::clone(bytes)),
                 )?;
+
                 map.end()
             }
-            Value::Link(link) => {
-                let mut map = encoder.encode_map(Some(1))?;
-                map.encode_entry(link.to_string(), Vec::<()>::new())?;
-                map.end()
-            }
+            Value::Link(link) => link.into_stream(encoder),
             Value::Number(number @ Number::Complex(_)) => {
                 let mut map = encoder.encode_map(Some(1))?;
-                map.encode_entry(ValueType::Number(number.class()).path().to_string(), number)?;
+                map.encode_entry(ValueType::Number(number.class()).path(), number)?;
                 map.end()
             }
             Value::Number(number) => number.into_stream(encoder),
-            Value::String(string) => string.into_stream(encoder),
+            Value::String(string) => encode_string(string, encoder),
             tuple @ Value::Tuple(_) => {
                 let mut next = Some(tuple);
                 let mut frames: Vec<std::slice::Iter<'_, Value>> = Vec::new();
@@ -310,24 +318,17 @@ impl<'en> IntoStream<'en> for Value {
             Value::None => encoder.encode_unit(),
             Value::Bytes(bytes) => {
                 let mut map = encoder.encode_map(Some(1))?;
-                map.encode_entry(
-                    ValueType::Bytes.path().to_string(),
-                    bytes::Bytes::from_owner(bytes),
-                )?;
+                map.encode_entry(ValueType::Bytes.path(), bytes::Bytes::from_owner(bytes))?;
                 map.end()
             }
-            Value::Link(link) => {
-                let mut map = encoder.encode_map(Some(1))?;
-                map.encode_entry(link.to_string(), Vec::<()>::new())?;
-                map.end()
-            }
+            Value::Link(link) => link.into_stream(encoder),
             Value::Number(number @ Number::Complex(_)) => {
                 let mut map = encoder.encode_map(Some(1))?;
-                map.encode_entry(ValueType::Number(number.class()).path().to_string(), number)?;
+                map.encode_entry(ValueType::Number(number.class()).path(), number)?;
                 map.end()
             }
             Value::Number(number) => number.into_stream(encoder),
-            Value::String(string) => string.into_stream(encoder),
+            Value::String(string) => encode_string(string, encoder),
             tuple @ Value::Tuple(_) => {
                 let mut next = Some(tuple);
                 let mut frames: Vec<std::vec::IntoIter<Value>> = Vec::new();
