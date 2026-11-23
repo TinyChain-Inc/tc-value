@@ -9,7 +9,6 @@ use destream::{en, IntoStream};
 use futures::{FutureExt, StreamExt, TryStreamExt};
 use get_size::GetSize;
 use number_general::{Complex, ComplexType, FloatType, IntType, Number, NumberType, UIntType};
-
 use safecast::TryCastFrom;
 
 use super::tests::nested;
@@ -20,6 +19,94 @@ use crate::{Value, ValueCollator, ValueType};
 enum Codec {
     Json,
     Tbon,
+}
+
+#[tokio::test]
+async fn natural_links_escape_only_ambiguous_value_strings() {
+    for codec in [Codec::Json, Codec::Tbon] {
+        for text in [
+            "https://example.com/resource",
+            "HTTP://example.com/",
+            "/",
+            "/state/scalar/value/tuple",
+            "/state/scalar/ref/cond",
+            "/literal%25name/%CE%BB",
+        ] {
+            let link = Value::from(text.parse::<pathlink::Link>().unwrap());
+            let wire = codec.encode(text.to_owned()).await;
+            assert_eq!(codec.decode(wire, 1).await.unwrap(), link);
+            for value in [link, Value::from(text.to_owned())] {
+                let bytes = codec.encode(&value).await;
+                assert_eq!(bytes, codec.encode(value.clone()).await);
+                assert_eq!(codec.decode(bytes, 1).await.unwrap(), value);
+                let tuple = Value::Tuple(vec![value.clone(), Value::Tuple(vec![value])]);
+                assert_eq!(
+                    codec.decode(codec.encode(&tuple).await, 1).await.unwrap(),
+                    tuple
+                );
+            }
+        }
+
+        for text in [
+            "ordinary",
+            "42",
+            "$id",
+            "ftp://example.com/x",
+            "http://",
+            "/bad%escape",
+        ] {
+            let value = Value::from(text);
+            assert_eq!(
+                codec.encode(&value).await,
+                codec.encode(text.to_owned()).await
+            );
+
+            assert_eq!(
+                codec.decode(codec.encode(&value).await, 1).await.unwrap(),
+                value
+            );
+        }
+
+        for payload in [0_u64, 42] {
+            let map = std::collections::BTreeMap::from([("https://example.com/x", payload)]);
+            assert!(codec.decode(codec.encode(map).await, 1).await.is_err());
+        }
+
+        let map = std::collections::BTreeMap::from([("https://example.com/x", Vec::<u64>::new())]);
+        assert!(codec.decode(codec.encode(map).await, 1).await.is_err());
+    }
+
+    let string = Value::from("https://example.com/resource");
+    assert_eq!(
+        Codec::Json.encode(&string).await,
+        br#"{"/state/scalar/value/string":"https://example.com/resource"}"#
+    );
+}
+
+#[tokio::test]
+async fn decoding_compacts_owned_containers_and_preserves_literal_links() {
+    for codec in [Codec::Json, Codec::Tbon] {
+        for count in [0, 1, 3, 5, 9, 17] {
+            let value = Value::Tuple(vec![Value::from("text"); count]);
+            let decoded = codec.decode(codec.encode(&value).await, 1).await.unwrap();
+            assert_eq!(decoded, value);
+            assert!(decoded.get_size() <= value.get_size());
+        }
+
+        for path in [
+            "/state/scalar/value/tuple",
+            "/state/scalar/op/post",
+            "/state/scalar/ref/cond",
+            "/a/b/c/d/e/f/g/h/i/j",
+        ] {
+            let value = Value::Link(path.parse().unwrap());
+            let borrowed = codec.encode(&value).await;
+            assert_eq!(borrowed, codec.encode(value.clone()).await);
+            let decoded = codec.decode(borrowed, 1).await.unwrap();
+            assert_eq!(decoded, value);
+            assert!(decoded.get_size() <= value.get_size());
+        }
+    }
 }
 
 impl Codec {
@@ -67,18 +154,20 @@ impl<'a> IntoStream<'a> for TypedTuples {
         let open = (0..self.0).flat_map(|_| {
             [
                 en::Event::MapStart(Some(1)),
-                en::Event::Value(Value::from(ValueType::Tuple.path().to_string())),
+                en::Event::Value(Some(ValueType::Tuple.path())),
                 en::Event::SeqStart(Some(1)),
             ]
         });
+
         let extra_open = self.1.then_some(en::Event::SeqStart(Some(1)));
         let extra_close = self.1.then_some(en::Event::End);
         let events = open
             .chain(extra_open)
-            .chain([en::Event::Value(Value::default())])
+            .chain([en::Event::Value(None::<pathlink::PathBuf>)])
             .chain(extra_close)
             .chain((0..2 * self.0).map(|_| en::Event::End))
             .map(Ok::<_, E::Error>);
+
         encoder.encode_events(futures::stream::iter(events))
     }
 }
@@ -174,7 +263,7 @@ async fn interrupted_construction_and_owned_encoding_release_deep_values() {
 }
 
 #[tokio::test]
-async fn typed_payload_validation_and_extra_entries_preserve_wire_behavior() {
+async fn typed_payload_validation_preserves_wire_behavior() {
     for codec in [Codec::Json, Codec::Tbon] {
         for suffix in [
             "number",
@@ -329,11 +418,90 @@ async fn typed_payload_validation_and_extra_entries_preserve_wire_behavior() {
             "{input}"
         );
     }
-    let input = br#"{"/state/scalar/value/tuple":[null],"ignored":{"deep":[1,2]}}"#;
-    assert_eq!(
-        Codec::Json.decode(input.to_vec(), 1).await.unwrap(),
-        vec![Value::default()].into()
-    );
+}
+
+#[tokio::test]
+async fn typed_records_require_unit_null_and_exactly_one_entry() {
+    for codec in [Codec::Json, Codec::Tbon] {
+        for payload in [
+            Value::from(7_u64),
+            Value::from("invalid"),
+            Value::Tuple(Vec::new()),
+        ] {
+            let entries =
+                en::MapStream::from(futures::stream::iter([(ValueType::None.path(), payload)]));
+
+            assert!(codec.decode(codec.encode(entries).await, 1).await.is_err());
+        }
+
+        for (class, payload) in [
+            (ValueType::None, Value::None),
+            (ValueType::String, Value::from("literal")),
+            (ValueType::Tuple, Value::Tuple(vec![Value::None])),
+        ] {
+            let key = class.path().to_string();
+            let entries =
+                en::MapStream::from(futures::stream::iter([(key.clone(), payload.clone())]));
+
+            assert_eq!(
+                codec.decode(codec.encode(entries).await, 1).await.unwrap(),
+                payload
+            );
+
+            for extra_key in [key.clone(), "ignored".to_owned()] {
+                let entries = en::MapStream::from(futures::stream::iter([
+                    (key.clone(), payload.clone()),
+                    (extra_key, Value::None),
+                ]));
+
+                assert!(codec.decode(codec.encode(entries).await, 1).await.is_err());
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn extra_type_entry_rejects_without_waiting_for_its_payload() {
+    for codec in [Codec::Json, Codec::Tbon] {
+        for (class, payload) in [
+            (ValueType::String, Value::from("literal")),
+            (ValueType::Tuple, Value::Tuple(Vec::new())),
+        ] {
+            let entries = en::MapStream::from(futures::stream::iter([(class.path(), payload)]));
+            let mut prefix = codec.encode(entries).await;
+            assert_eq!(prefix.pop(), Some(b'}'));
+            prefix.extend_from_slice(match codec {
+                Codec::Json => b",\"ignored\":[",
+                Codec::Tbon => b"\"ignored\"[",
+            });
+
+            let owner = Arc::new(());
+            let released = Arc::downgrade(&owner);
+            let source = futures::stream::iter([Bytes::from(prefix)])
+                .chain(futures::stream::pending())
+                .inspect(move |_| {
+                    let _ = &owner;
+                });
+
+            let decode = async {
+                match codec {
+                    Codec::Json => destream_json::decode::<_, Value>((), source)
+                        .await
+                        .map_err(|e| e.to_string()),
+                    Codec::Tbon => tbon::de::decode::<_, Value>((), source)
+                        .await
+                        .map_err(|e| e.to_string()),
+                }
+            };
+
+            assert!(decode
+                .now_or_never()
+                .expect("reject without reading extra payload")
+                .is_err());
+
+            assert!(released.upgrade().is_none());
+        }
+    }
 }
 
 #[tokio::test]
@@ -395,12 +563,29 @@ async fn link_uri_keys_remain_distinct_from_literal_paths() {
         let link = pathlink::Link::from(path.clone());
         let value = Value::from(link.clone());
         assert_ne!(path.to_string(), link.to_string());
-        let encoded = destream_json::encode(value.clone()).unwrap();
-        let decoded: Value = destream_json::try_decode((), encoded).await.unwrap();
-        assert_eq!(decoded, value);
-        let encoded = tbon::en::encode(&value).unwrap();
-        let decoded: Value = tbon::de::try_decode((), encoded).await.unwrap();
-        assert_eq!(decoded, value);
+        let uri = match name {
+            "λ" => "/%CE%BB",
+            "literal%name" => "/literal%25name",
+            "%2f" => "/%252f",
+            _ => unreachable!(),
+        };
+
+        assert_eq!(link.to_string(), uri);
+        let expected_json = format!("\"{uri}\"");
+        assert_eq!(Codec::Json.encode(&value).await, expected_json.as_bytes());
+        let expected_tbon = format!("\"{uri}\"");
+        assert_eq!(Codec::Tbon.encode(&value).await, expected_tbon.as_bytes());
+        for codec in [Codec::Json, Codec::Tbon] {
+            let expected_link = format!("\"{uri}\"");
+            let expected_path = format!("\"{path}\"");
+            assert_eq!(codec.encode(&link).await, expected_link.as_bytes());
+            assert_eq!(codec.encode(link.clone()).await, expected_link.as_bytes());
+            assert_eq!(codec.encode(&path).await, expected_path.as_bytes());
+            assert_eq!(codec.encode(path.clone()).await, expected_path.as_bytes());
+            let borrowed = codec.encode(&value).await;
+            assert_eq!(borrowed, codec.encode(value.clone()).await);
+            assert_eq!(codec.decode(borrowed, 1).await.unwrap(), value);
+        }
     }
 }
 

@@ -8,6 +8,29 @@ use futures::TryStreamExt;
 use super::*;
 
 #[test]
+fn value_type_references_use_canonical_hostless_links() {
+    for dtype in [
+        ValueType::String,
+        ValueType::Link,
+        ValueType::Number(NumberType::Number),
+    ] {
+        let value = Value::cast_from(dtype.clone());
+        assert!(matches!(&value, Value::Link(link) if link.host().is_none()));
+        assert_eq!(ValueType::opt_cast_from(value), Some(dtype.clone()));
+        assert_eq!(
+            ValueType::opt_cast_from(Value::from(dtype.path().to_string())),
+            Some(dtype.clone())
+        );
+
+        let hosted: Link = format!("https://example.com{}", dtype.path())
+            .parse()
+            .unwrap();
+
+        assert!(!ValueType::can_cast_from(&Value::Link(hosted)));
+    }
+}
+
+#[test]
 fn cast_tagged_bounds() {
     for input in [
         Value::None,
@@ -817,4 +840,71 @@ fn conversion_predicates_agree_with_consumption() {
         borrowed::<&str>(value);
         borrowed::<Cow<'_, str>>(value);
     }
+}
+
+#[test]
+fn complex_value_order_distinguishes_equal_norms_and_preserves_equality() {
+    let collator = ValueCollator::default();
+    let left = Value::Number("4+3i".parse().unwrap());
+    let right = Value::Number("3+4i".parse().unwrap());
+    assert!(collator.cmp(&left, &right).is_gt());
+    assert!(collator.cmp(&right, &left).is_lt());
+    assert!(collator.cmp(&Value::from(1u64), &Value::from(1f64)).is_eq());
+    assert!(collator
+        .cmp(&Value::Tuple(vec![left]), &Value::Tuple(vec![right]))
+        .is_gt());
+
+    assert!(collator
+        .cmp(
+            &Value::Tuple(vec![Value::Number("4+3i".parse().unwrap()), 0u64.into()]),
+            &Value::Tuple(vec![Value::Number("3+4i".parse().unwrap()), 100u64.into()]),
+        )
+        .is_gt());
+
+    let a = Value::Number(number_general::Number::from(number_general::Complex::from(
+        [f64::NAN, 1.],
+    )));
+
+    let b = Value::Number(number_general::Number::from(number_general::Complex::from(
+        [2., f64::NAN],
+    )));
+
+    assert!(collator.cmp(&a, &a).is_eq());
+    assert_eq!(collator.cmp(&a, &b), collator.cmp(&b, &a).reverse());
+    assert!(!collator.cmp(&a, &b).is_eq());
+}
+
+#[test]
+fn value_collation_matches_equality_and_is_transitive() {
+    let collator = ValueCollator::default();
+    let values = [
+        Value::None,
+        Value::from("a"),
+        Value::from("b"),
+        Value::Bytes(std::sync::Arc::from([1u8, 2])),
+        Value::from(1u64),
+        Value::from(1f64),
+        Value::Number("4+3i".parse().unwrap()),
+        Value::Number("3+4i".parse().unwrap()),
+        Value::Tuple(vec![Value::from("a"), Value::from(2u64)]),
+        Value::Tuple(vec![Value::from("b"), Value::from(1u64)]),
+    ];
+
+    for left in &values {
+        for right in &values {
+            assert_eq!(
+                collator.cmp(left, right),
+                collator.cmp(right, left).reverse()
+            );
+
+            assert_eq!(collator.cmp(left, right).is_eq(), left == right);
+            for third in &values {
+                if collator.cmp(left, right).is_le() && collator.cmp(right, third).is_le() {
+                    assert!(collator.cmp(left, third).is_le());
+                }
+            }
+        }
+    }
+
+    assert!(collator.cmp(&Value::from("a"), &Value::from("b")).is_lt());
 }

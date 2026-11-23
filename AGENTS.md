@@ -28,8 +28,12 @@ strings, and tuples.
   request errors, routing, and execution.
 - `Value` has intrinsic equality but no intrinsic ordering. All ordered storage,
   ranges, and stream merges must use `ValueCollator`, which delegates numbers to
-  `NumberCollator` and recursively collates tuples. Do not implement `Ord` or
-  `PartialOrd` for `Value`, compare serialized forms, or use `Collator<Value>`.
+  `NumberCollator` and recursively collates tuples. Complex norm ties are resolved
+  by numerical component comparison in `number-general`; Value adds no secondary
+  numerical ordering. B-tree owns prefix and complete-key comparison; callers
+  delegate selected-index ordering.
+  Do not implement `Ord` or `PartialOrd` for `Value`, compare serialized forms,
+  or use `Collator<Value>`.
 - Avoid feature-flag forks. The same `Value` definitions must compile on every
   target (kernel, PyO3, WASM) so the control plane stays deterministic.
 
@@ -37,6 +41,9 @@ strings, and tuples.
 
 - `de::FromStream`/`en::IntoStream` are the canonical encoding. Keep them
   symmetric and do not add alternate envelopes.
+- A typed-value envelope contains exactly one entry. Its payload must match the
+  declared type; typed None requires unit/null. Reject additional entries without
+  decoding their payloads. Callers pass parsed type paths to the owning codec.
 - Normalize scalar coercions through `number_general::Number`. If you add string,
   tuple, or binary support, route all parsing through shared helper modules so
   clients cannot mint incompatible representations.
