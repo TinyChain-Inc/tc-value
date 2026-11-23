@@ -99,9 +99,7 @@ async fn decode_leaf<D: de::Decoder>(
         ValueType::Link => {
             let link = String::from_stream((), decoder).await?;
             decoder.finish_child(map).await?;
-            Link::from_str(&link)
-                .map_err(|e| de::Error::custom(e.to_string()))?
-                .into()
+            Link::from_str(&link).map_err(de::Error::custom)?.into()
         }
         ValueType::Tuple => unreachable!("tuple payloads have a construction frame"),
     })
